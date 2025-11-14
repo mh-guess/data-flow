@@ -60,7 +60,7 @@ python example_flow.py
 
 3. Open your browser to http://127.0.0.1:4200 to see the Prefect UI
 
-### Deploying to Prefect Cloud (Optional)
+### Deploying to Prefect Cloud
 
 1. Create a free account at https://app.prefect.cloud
 
@@ -69,7 +69,9 @@ python example_flow.py
 prefect cloud login
 ```
 
-3. Run your flow - it will automatically sync to Prefect Cloud
+3. Configure credentials in Prefect Cloud (see [SETUP.md](SETUP.md) for detailed instructions)
+
+4. Run your flow - it will automatically sync to Prefect Cloud
 
 ## Next Steps
 
