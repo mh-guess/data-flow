@@ -1,0 +1,55 @@
+# Prefect Deployment Configuration
+# This file manages the Tiingo to S3 ETL deployment as Infrastructure as Code
+
+# Prefect version this file is compatible with
+prefect-version: 2.14.0
+
+# Deployment configurations
+deployments:
+  - name: tiingo-to-s3-production
+    description: "ETL pipeline that fetches daily price data from Tiingo API and loads to S3"
+    version: 1.0.0
+    tags:
+      - etl
+      - tiingo
+      - s3
+      - production
+
+    # Flow entrypoint
+    entrypoint: tiingo_to_s3_flow.py:tiingo_to_s3_flow
+
+    # Schedule: 6 PM on weekdays (Mon-Fri)
+    # Note: Adjust timezone in Prefect Cloud UI to America/Los_Angeles
+    schedules:
+      - cron: "0 18 * * 1-5"
+        timezone: "America/Los_Angeles"
+        active: true
+
+    # Work pool configuration (using Prefect Cloud managed execution)
+    work_pool:
+      name: "default-agent-pool"
+
+    # Build step - no custom build needed
+    build: null
+
+    # Push step - code is in GitHub
+    push:
+      - prefect.deployments.steps.git_clone:
+          repository: https://github.com/mh-guess/data-flow.git
+          branch: main
+
+    # Pull step - pull from GitHub when running
+    pull:
+      - prefect.deployments.steps.git_clone:
+          repository: https://github.com/mh-guess/data-flow.git
+          branch: main
+
+    # Python dependencies
+    requirements:
+      - prefect>=2.14.0
+      - requests>=2.31.0
+      - boto3>=1.29.0
+      - prefect-aws>=0.4.0
+
+# Global configuration
+name: tiingo-data-pipeline
