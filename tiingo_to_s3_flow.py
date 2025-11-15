@@ -113,7 +113,7 @@ def transform_data(ticker_data_list: list) -> dict:
 @task(retries=2, retry_delay_seconds=5)
 def load_to_s3(data: dict, bucket_name: str, aws_credentials: AwsCredentials) -> list:
     """
-    Load transformed data to AWS S3, partitioned by ticker and year.
+    Load transformed data to AWS S3, partitioned by date.
 
     Args:
         data: Transformed data dictionary
@@ -125,24 +125,23 @@ def load_to_s3(data: dict, bucket_name: str, aws_credentials: AwsCredentials) ->
     """
     print(f"Loading data to S3 bucket: {bucket_name}...")
 
-    # Generate filename with current date (YYYYMMDD format)
+    # Generate date partition (YYYY-MM-DD format)
     current_date = datetime.now()
-    date_str = current_date.strftime('%Y%m%d')
-    year = current_date.strftime('%Y')
+    date_partition = current_date.strftime('%Y-%m-%d')
 
     # Get S3 client using AWS credentials from Prefect Cloud
     s3_client = aws_credentials.get_boto3_session().client('s3')
     uploaded_keys = []
 
-    # Save each ticker separately with partitioning
+    # Save each ticker separately with date partitioning
     for ticker, ticker_data in data["tickers"].items():
-        # Create S3 key with partition structure: tiingo/{ticker}/{year}/daily_prices_YYYYMMDD.json
-        s3_key = f"tiingo/{ticker}/{year}/daily_prices_{date_str}.json"
+        # Create S3 key: tiingo/json/date={YYYY-MM-DD}/{ticker}.json
+        s3_key = f"tiingo/json/date={date_partition}/{ticker}.json"
 
         # Create ticker-specific data structure
         ticker_output = {
             "ticker": ticker,
-            "year": year,
+            "date": date_partition,
             "extracted_at": data["metadata"]["extracted_at"],
             "record_count": len(ticker_data),
             "data": ticker_data
