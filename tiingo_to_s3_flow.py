@@ -9,7 +9,7 @@ S3 Structure: s3://mh-guess-data/tiingo/json/load_type=daily/date={YYYY-MM-DD}/{
 This is the incremental daily pipeline. For historical backfills, see tiingo_backfill_flow.py.
 """
 
-from prefect import flow, task
+from prefect import flow, task, get_run_logger
 from prefect.blocks.system import Secret
 from prefect_aws import AwsCredentials
 from datetime import datetime, timedelta
@@ -35,7 +35,8 @@ def fetch_tickers_from_s3(bucket_name: str, s3_key: str, aws_credentials: AwsCre
     Returns:
         List of ticker symbols
     """
-    print(f"Fetching tickers from s3://{bucket_name}/{s3_key}...")
+    logger = get_run_logger()
+    logger.info(f"Fetching tickers from s3://{bucket_name}/{s3_key}...")
 
     # Get S3 client using AWS credentials from Prefect Cloud
     s3_client = aws_credentials.get_boto3_session().client('s3')
@@ -47,7 +48,7 @@ def fetch_tickers_from_s3(bucket_name: str, s3_key: str, aws_credentials: AwsCre
     # Parse tickers (one per line, strip whitespace)
     tickers = [line.strip() for line in tickers_content.strip().split('\n') if line.strip()]
 
-    print(f"Loaded {len(tickers)} tickers: {', '.join(tickers)}")
+    logger.info(f"Loaded {len(tickers)} tickers: {', '.join(tickers)}")
     return tickers
 
 
@@ -63,7 +64,8 @@ def extract_ticker_data(ticker: str, api_token: str) -> dict:
     Returns:
         Dictionary with ticker data
     """
-    print(f"Extracting data for {ticker}...")
+    logger = get_run_logger()
+    logger.info(f"Extracting data for {ticker}...")
 
     # Tiingo API endpoint for daily prices
     # Get last 30 days of data
@@ -84,7 +86,7 @@ def extract_ticker_data(ticker: str, api_token: str) -> dict:
     response.raise_for_status()
 
     data = response.json()
-    print(f"Extracted {len(data)} records for {ticker}")
+    logger.info(f"Extracted {len(data)} records for {ticker}")
 
     return {
         "ticker": ticker,
@@ -124,7 +126,8 @@ def transform_data(ticker_data_list: list) -> dict:
     Returns:
         Transformed data dictionary
     """
-    print("Transforming data...")
+    logger = get_run_logger()
+    logger.info("Transforming data...")
 
     # Extract ticker symbols from the data
     tickers = [td["ticker"] for td in ticker_data_list]
@@ -142,7 +145,7 @@ def transform_data(ticker_data_list: list) -> dict:
         ticker = ticker_data["ticker"]
         transformed["tickers"][ticker] = ticker_data["data"]
 
-    print(f"Transformed data for {len(ticker_data_list)} tickers")
+    logger.info(f"Transformed data for {len(ticker_data_list)} tickers")
     return transformed
 
 
@@ -160,7 +163,8 @@ def load_to_s3(ticker_data_list: list, bucket_name: str, aws_credentials: AwsCre
     Returns:
         List of S3 keys for uploaded files
     """
-    print(f"Loading data to S3 bucket: {bucket_name}...")
+    logger = get_run_logger()
+    logger.info(f"Loading data to S3 bucket: {bucket_name}...")
 
     # Generate date partition (YYYY-MM-DD format)
     current_date = datetime.now()
@@ -190,9 +194,9 @@ def load_to_s3(ticker_data_list: list, bucket_name: str, aws_credentials: AwsCre
         )
 
         uploaded_keys.append(s3_key)
-        print(f"Uploaded {ticker} raw data ({len(raw_data)} records) to s3://{bucket_name}/{s3_key}")
+        logger.info(f"Uploaded {ticker} raw data ({len(raw_data)} records) to s3://{bucket_name}/{s3_key}")
 
-    print(f"Successfully loaded {len(uploaded_keys)} files to S3")
+    logger.info(f"Successfully loaded {len(uploaded_keys)} files to S3")
     return uploaded_keys
 
 
@@ -202,16 +206,17 @@ def tiingo_to_s3_flow():
     Main ETL flow that orchestrates data extraction from Tiingo
     and loading to S3.
     """
-    print(f"\n{'='*60}")
-    print(f"Starting Tiingo to S3 ETL Flow")
-    print(f"{'='*60}\n")
+    logger = get_run_logger()
+    logger.info("="*60)
+    logger.info("Starting Tiingo to S3 ETL Flow")
+    logger.info("="*60)
 
     # Load credentials from Prefect Cloud Blocks
-    print("Loading Tiingo API token from Prefect Cloud...")
+    logger.info("Loading Tiingo API token from Prefect Cloud...")
     tiingo_token_block = Secret.load("tiingo-api-token")
     api_token = tiingo_token_block.get()
 
-    print("Loading AWS credentials from Prefect Cloud...")
+    logger.info("Loading AWS credentials from Prefect Cloud...")
     aws_credentials = AwsCredentials.load("aws-credentials-tim")
 
     # Fetch tickers from S3
@@ -223,12 +228,12 @@ def tiingo_to_s3_flow():
     # Load raw data directly to S3 (no transformation)
     s3_keys = load_to_s3(raw_data, S3_BUCKET_NAME, aws_credentials)
 
-    print(f"\n{'='*60}")
-    print(f"Flow completed successfully!")
-    print(f"Uploaded {len(s3_keys)} files to S3:")
+    logger.info("="*60)
+    logger.info(f"Flow completed successfully!")
+    logger.info(f"Uploaded {len(s3_keys)} files to S3:")
     for key in s3_keys:
-        print(f"  - s3://{S3_BUCKET_NAME}/{key}")
-    print(f"{'='*60}\n")
+        logger.info(f"  - s3://{S3_BUCKET_NAME}/{key}")
+    logger.info("="*60)
 
     return s3_keys
 

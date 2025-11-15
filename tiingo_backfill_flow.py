@@ -10,7 +10,7 @@ Each file contains all trading days for that ticker in that year (~252 records).
 This minimizes API calls: 1 call per ticker per year instead of 1 per day.
 """
 
-from prefect import flow, task
+from prefect import flow, task, get_run_logger
 from prefect.blocks.system import Secret
 from prefect_aws import AwsCredentials
 from datetime import datetime
@@ -37,7 +37,8 @@ def fetch_tickers_from_s3(bucket_name: str, s3_key: str, aws_credentials: AwsCre
     Returns:
         List of ticker symbols
     """
-    print(f"Fetching tickers from s3://{bucket_name}/{s3_key}...")
+    logger = get_run_logger()
+    logger.info(f"Fetching tickers from s3://{bucket_name}/{s3_key}...")
 
     # Get S3 client using AWS credentials from Prefect Cloud
     s3_client = aws_credentials.get_boto3_session().client('s3')
@@ -49,7 +50,7 @@ def fetch_tickers_from_s3(bucket_name: str, s3_key: str, aws_credentials: AwsCre
     # Parse tickers (one per line, strip whitespace)
     tickers = [line.strip() for line in tickers_content.strip().split('\n') if line.strip()]
 
-    print(f"Loaded {len(tickers)} tickers: {', '.join(tickers)}")
+    logger.info(f"Loaded {len(tickers)} tickers: {', '.join(tickers)}")
     return tickers
 
 
@@ -66,7 +67,8 @@ def fetch_year_data(ticker: str, year: int, api_token: str) -> dict:
     Returns:
         Dictionary with ticker, year, and data
     """
-    print(f"Fetching {year} data for {ticker}...")
+    logger = get_run_logger()
+    logger.info(f"Fetching {year} data for {ticker}...")
 
     # Tiingo API endpoint for daily prices
     start_date = f"{year}-01-01"
@@ -86,7 +88,7 @@ def fetch_year_data(ticker: str, year: int, api_token: str) -> dict:
     response.raise_for_status()
 
     data = response.json()
-    print(f"Fetched {len(data)} records for {ticker} in {year}")
+    logger.info(f"Fetched {len(data)} records for {ticker} in {year}")
 
     return {
         "ticker": ticker,
@@ -114,6 +116,7 @@ def load_year_to_s3(
     Returns:
         S3 key of uploaded file
     """
+    logger = get_run_logger()
     ticker = ticker_year_data["ticker"]
     year = ticker_year_data["year"]
     data = ticker_year_data["data"]
@@ -121,7 +124,7 @@ def load_year_to_s3(
     # Create S3 key: tiingo/json/load_type=retro/year={YYYY}/{ticker}.json
     s3_key = f"tiingo/json/load_type=retro/year={year}/{ticker}.json"
 
-    print(f"Loading {ticker} {year} data ({len(data)} records) to S3...")
+    logger.info(f"Loading {ticker} {year} data ({len(data)} records) to S3...")
 
     # Get S3 client using AWS credentials from Prefect Cloud
     s3_client = aws_credentials.get_boto3_session().client('s3')
@@ -137,7 +140,7 @@ def load_year_to_s3(
         ContentType='application/json'
     )
 
-    print(f"Uploaded to s3://{bucket_name}/{s3_key}")
+    logger.info(f"Uploaded to s3://{bucket_name}/{s3_key}")
     return s3_key
 
 
@@ -167,30 +170,31 @@ def tiingo_backfill_flow(
         # Backfill specific tickers
         tiingo_backfill_flow(start_year=2020, end_year=2024, tickers=["AAPL", "TSLA"])
     """
-    print(f"\n{'='*60}")
-    print(f"Starting Tiingo Historical Backfill")
-    print(f"Years: {start_year} to {end_year}")
-    print(f"{'='*60}\n")
+    logger = get_run_logger()
+    logger.info("="*60)
+    logger.info("Starting Tiingo Historical Backfill")
+    logger.info(f"Years: {start_year} to {end_year}")
+    logger.info("="*60)
 
     # Load credentials from Prefect Cloud Blocks
-    print("Loading Tiingo API token from Prefect Cloud...")
+    logger.info("Loading Tiingo API token from Prefect Cloud...")
     tiingo_token_block = Secret.load("tiingo-api-token")
     api_token = tiingo_token_block.get()
 
-    print("Loading AWS credentials from Prefect Cloud...")
+    logger.info("Loading AWS credentials from Prefect Cloud...")
     aws_credentials = AwsCredentials.load("aws-credentials-tim")
 
     # Fetch tickers
     if tickers is None:
-        print("No tickers provided, fetching from S3...")
+        logger.info("No tickers provided, fetching from S3...")
         tickers = fetch_tickers_from_s3(S3_BUCKET_NAME, TICKERS_S3_KEY, aws_credentials)
     else:
-        print(f"Using provided tickers: {', '.join(tickers)}")
+        logger.info(f"Using provided tickers: {', '.join(tickers)}")
 
     # Calculate total operations
     years = list(range(start_year, end_year + 1))
     total_ops = len(tickers) * len(years)
-    print(f"\nBackfill plan: {len(tickers)} tickers × {len(years)} years = {total_ops} API calls\n")
+    logger.info(f"Backfill plan: {len(tickers)} tickers × {len(years)} years = {total_ops} API calls")
 
     # Track results
     uploaded_keys = []
@@ -205,13 +209,13 @@ def tiingo_backfill_flow(
             s3_key = load_year_to_s3(year_data, S3_BUCKET_NAME, aws_credentials)
             uploaded_keys.append(s3_key)
 
-    print(f"\n{'='*60}")
-    print(f"Backfill completed successfully!")
-    print(f"Total files uploaded: {len(uploaded_keys)}")
-    print(f"Years processed: {start_year}-{end_year}")
-    print(f"Tickers processed: {', '.join(tickers)}")
-    print(f"\nData location: s3://{S3_BUCKET_NAME}/tiingo/json/load_type=retro/")
-    print(f"{'='*60}\n")
+    logger.info("="*60)
+    logger.info("Backfill completed successfully!")
+    logger.info(f"Total files uploaded: {len(uploaded_keys)}")
+    logger.info(f"Years processed: {start_year}-{end_year}")
+    logger.info(f"Tickers processed: {', '.join(tickers)}")
+    logger.info(f"Data location: s3://{S3_BUCKET_NAME}/tiingo/json/load_type=retro/")
+    logger.info("="*60)
 
     return {
         "uploaded_keys": uploaded_keys,
