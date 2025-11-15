@@ -80,7 +80,9 @@ By using `prefect.yaml`, you get:
 
 ## Manual Flow Runs
 
-To manually trigger a flow run:
+### Daily Flow (Scheduled)
+
+To manually trigger the daily flow:
 
 ```bash
 # Using prefect-cloud CLI
@@ -89,6 +91,38 @@ uvx prefect-cloud run tiingo_to_s3_flow/tiingo_to_s3_flow
 # Or using Prefect CLI
 prefect deployment run tiingo-to-s3-production
 ```
+
+### Backfill Flow (On-Demand)
+
+The backfill flow fetches historical data with year-level partitioning for efficient API usage.
+
+**Run with default parameters (2020-2024)**:
+```bash
+# Using Prefect CLI
+prefect deployment run tiingo-backfill
+```
+
+**Run with custom year range**:
+```bash
+# Backfill 2015-2019
+prefect deployment run tiingo-backfill \
+  --param start_year=2015 \
+  --param end_year=2019
+
+# Backfill specific tickers for 2022-2024
+prefect deployment run tiingo-backfill \
+  --param start_year=2022 \
+  --param end_year=2024 \
+  --param tickers='["AAPL","TSLA","NVDA"]'
+```
+
+**Data Structure**:
+- Daily flow: `s3://mh-guess-data/tiingo/json/load_type=daily/date={YYYY-MM-DD}/{ticker}.json`
+- Backfill flow: `s3://mh-guess-data/tiingo/json/load_type=retro/year={YYYY}/{ticker}.json`
+
+**API Efficiency**:
+- 5-year backfill for 5 tickers = 25 API calls (1 per ticker per year)
+- vs 6,300 calls if fetching day-by-day!
 
 ## Removing Schedule
 

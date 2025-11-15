@@ -51,5 +51,52 @@ deployments:
       - boto3>=1.29.0
       - prefect-aws>=0.4.0
 
+  - name: tiingo-backfill
+    description: "On-demand historical data backfill with year-level partitioning (load_type=retro)"
+    version: 1.0.0
+    tags:
+      - backfill
+      - tiingo
+      - s3
+      - historical
+      - retro
+
+    # Flow entrypoint
+    entrypoint: tiingo_backfill_flow.py:tiingo_backfill_flow
+
+    # No schedule - this is on-demand only
+    schedules: []
+
+    # Default parameters for backfill
+    parameters:
+      start_year: 2020
+      end_year: 2024
+
+    # Work pool configuration (using Prefect Cloud managed execution)
+    work_pool:
+      name: "default-agent-pool"
+
+    # Build step - no custom build needed
+    build: null
+
+    # Push step - code is in GitHub
+    push:
+      - prefect.deployments.steps.git_clone:
+          repository: https://github.com/mh-guess/data-flow.git
+          branch: main
+
+    # Pull step - pull from GitHub when running
+    pull:
+      - prefect.deployments.steps.git_clone:
+          repository: https://github.com/mh-guess/data-flow.git
+          branch: main
+
+    # Python dependencies
+    requirements:
+      - prefect>=2.14.0
+      - requests>=2.31.0
+      - boto3>=1.29.0
+      - prefect-aws>=0.4.0
+
 # Global configuration
 name: tiingo-data-pipeline

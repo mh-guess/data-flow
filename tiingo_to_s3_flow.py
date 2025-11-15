@@ -1,8 +1,12 @@
 """
-Tiingo to S3 ETL Pipeline
+Tiingo to S3 Daily ETL Pipeline
 
 Fetches daily price data from Tiingo API and loads it to AWS S3.
 Uses Prefect Cloud Blocks for secure credential management.
+
+S3 Structure: s3://mh-guess-data/tiingo/json/load_type=daily/date={YYYY-MM-DD}/{ticker}.json
+
+This is the incremental daily pipeline. For historical backfills, see tiingo_backfill_flow.py.
 """
 
 from prefect import flow, task
@@ -166,13 +170,13 @@ def load_to_s3(ticker_data_list: list, bucket_name: str, aws_credentials: AwsCre
     s3_client = aws_credentials.get_boto3_session().client('s3')
     uploaded_keys = []
 
-    # Save each ticker's raw data separately with date partitioning
+    # Save each ticker's raw data separately with type and date partitioning
     for ticker_data in ticker_data_list:
         ticker = ticker_data["ticker"]
         raw_data = ticker_data["data"]  # Raw data from Tiingo API
 
-        # Create S3 key: tiingo/json/date={YYYY-MM-DD}/{ticker}.json
-        s3_key = f"tiingo/json/date={date_partition}/{ticker}.json"
+        # Create S3 key: tiingo/json/load_type=daily/date={YYYY-MM-DD}/{ticker}.json
+        s3_key = f"tiingo/json/load_type=daily/date={date_partition}/{ticker}.json"
 
         # Save raw data as-is (compact JSON, no pretty formatting)
         json_data = json.dumps(raw_data)
