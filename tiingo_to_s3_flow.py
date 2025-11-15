@@ -143,12 +143,13 @@ def transform_data(ticker_data_list: list) -> dict:
 
 
 @task(retries=2, retry_delay_seconds=5)
-def load_to_s3(data: dict, bucket_name: str, aws_credentials: AwsCredentials) -> list:
+def load_to_s3(ticker_data_list: list, bucket_name: str, aws_credentials: AwsCredentials) -> list:
     """
-    Load transformed data to AWS S3, partitioned by date.
+    Load raw Tiingo data to AWS S3, partitioned by date.
+    Saves data exactly as received from Tiingo API without any transformation.
 
     Args:
-        data: Transformed data dictionary
+        ticker_data_list: List of raw ticker data from Tiingo API
         bucket_name: S3 bucket name
         aws_credentials: AWS credentials from Prefect Cloud
 
@@ -165,22 +166,16 @@ def load_to_s3(data: dict, bucket_name: str, aws_credentials: AwsCredentials) ->
     s3_client = aws_credentials.get_boto3_session().client('s3')
     uploaded_keys = []
 
-    # Save each ticker separately with date partitioning
-    for ticker, ticker_data in data["tickers"].items():
+    # Save each ticker's raw data separately with date partitioning
+    for ticker_data in ticker_data_list:
+        ticker = ticker_data["ticker"]
+        raw_data = ticker_data["data"]  # Raw data from Tiingo API
+
         # Create S3 key: tiingo/json/date={YYYY-MM-DD}/{ticker}.json
         s3_key = f"tiingo/json/date={date_partition}/{ticker}.json"
 
-        # Create ticker-specific data structure
-        ticker_output = {
-            "ticker": ticker,
-            "date": date_partition,
-            "extracted_at": data["metadata"]["extracted_at"],
-            "record_count": len(ticker_data),
-            "data": ticker_data
-        }
-
-        # Convert to JSON
-        json_data = json.dumps(ticker_output, indent=2)
+        # Save raw data as-is (no transformation)
+        json_data = json.dumps(raw_data, indent=2)
 
         # Upload to S3
         s3_client.put_object(
@@ -191,7 +186,7 @@ def load_to_s3(data: dict, bucket_name: str, aws_credentials: AwsCredentials) ->
         )
 
         uploaded_keys.append(s3_key)
-        print(f"Uploaded {ticker} data to s3://{bucket_name}/{s3_key}")
+        print(f"Uploaded {ticker} raw data ({len(raw_data)} records) to s3://{bucket_name}/{s3_key}")
 
     print(f"Successfully loaded {len(uploaded_keys)} files to S3")
     return uploaded_keys
@@ -221,11 +216,8 @@ def tiingo_to_s3_flow():
     # Extract
     raw_data = extract_all_tickers(tickers, api_token)
 
-    # Transform
-    transformed_data = transform_data(raw_data)
-
-    # Load
-    s3_keys = load_to_s3(transformed_data, S3_BUCKET_NAME, aws_credentials)
+    # Load raw data directly to S3 (no transformation)
+    s3_keys = load_to_s3(raw_data, S3_BUCKET_NAME, aws_credentials)
 
     print(f"\n{'='*60}")
     print(f"Flow completed successfully!")
