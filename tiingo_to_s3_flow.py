@@ -174,8 +174,8 @@ def load_to_s3(ticker_data_list: list, bucket_name: str, aws_credentials: AwsCre
         # Create S3 key: tiingo/json/date={YYYY-MM-DD}/{ticker}.json
         s3_key = f"tiingo/json/date={date_partition}/{ticker}.json"
 
-        # Save raw data as-is (no transformation)
-        json_data = json.dumps(raw_data, indent=2)
+        # Save raw data as-is (compact JSON, no pretty formatting)
+        json_data = json.dumps(raw_data)
 
         # Upload to S3
         s3_client.put_object(
