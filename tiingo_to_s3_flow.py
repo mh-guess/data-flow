@@ -13,9 +13,38 @@ import requests
 import json
 
 
-# Tickers to fetch
-TICKERS = ["AAPL", "TSLA", "EQT", "PLTR", "CLS"]
+# Configuration
 S3_BUCKET_NAME = "mh-guess-data"
+TICKERS_S3_KEY = "adhoc/tickers.txt"
+
+
+@task(retries=2, retry_delay_seconds=5)
+def fetch_tickers_from_s3(bucket_name: str, s3_key: str, aws_credentials: AwsCredentials) -> list:
+    """
+    Fetch ticker list from S3 file.
+
+    Args:
+        bucket_name: S3 bucket name
+        s3_key: S3 key for the tickers file
+        aws_credentials: AWS credentials from Prefect Cloud
+
+    Returns:
+        List of ticker symbols
+    """
+    print(f"Fetching tickers from s3://{bucket_name}/{s3_key}...")
+
+    # Get S3 client using AWS credentials from Prefect Cloud
+    s3_client = aws_credentials.get_boto3_session().client('s3')
+
+    # Fetch the tickers file
+    response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+    tickers_content = response['Body'].read().decode('utf-8')
+
+    # Parse tickers (one per line, strip whitespace)
+    tickers = [line.strip() for line in tickers_content.strip().split('\n') if line.strip()]
+
+    print(f"Loaded {len(tickers)} tickers: {', '.join(tickers)}")
+    return tickers
 
 
 @task(retries=3, retry_delay_seconds=10)
@@ -93,10 +122,13 @@ def transform_data(ticker_data_list: list) -> dict:
     """
     print("Transforming data...")
 
+    # Extract ticker symbols from the data
+    tickers = [td["ticker"] for td in ticker_data_list]
+
     transformed = {
         "metadata": {
             "extracted_at": datetime.now().isoformat(),
-            "tickers": TICKERS,
+            "tickers": tickers,
             "record_count": sum(len(td["data"]) for td in ticker_data_list)
         },
         "tickers": {}
@@ -173,7 +205,6 @@ def tiingo_to_s3_flow():
     """
     print(f"\n{'='*60}")
     print(f"Starting Tiingo to S3 ETL Flow")
-    print(f"Tickers: {', '.join(TICKERS)}")
     print(f"{'='*60}\n")
 
     # Load credentials from Prefect Cloud Blocks
@@ -184,8 +215,11 @@ def tiingo_to_s3_flow():
     print("Loading AWS credentials from Prefect Cloud...")
     aws_credentials = AwsCredentials.load("aws-credentials-tim")
 
+    # Fetch tickers from S3
+    tickers = fetch_tickers_from_s3(S3_BUCKET_NAME, TICKERS_S3_KEY, aws_credentials)
+
     # Extract
-    raw_data = extract_all_tickers(TICKERS, api_token)
+    raw_data = extract_all_tickers(tickers, api_token)
 
     # Transform
     transformed_data = transform_data(raw_data)
