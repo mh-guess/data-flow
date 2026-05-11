@@ -10,6 +10,7 @@ Schedule: 6 PM ET weekdays (after market close).
 """
 
 from prefect import flow, task, get_run_logger
+from prefect.blocks.system import Secret
 from datetime import datetime, timedelta, timezone, date
 import requests
 import time
@@ -32,10 +33,11 @@ RATE_LIMIT_DELAY = 2
 
 
 @task(retries=2, retry_delay_seconds=5)
-def fetch_symbols_from_github() -> list[str]:
+def fetch_symbols_from_github(github_token: str) -> list[str]:
     """Fetch the APEX symbol list from the mh-guess/apex repo on GitHub."""
     logger = get_run_logger()
-    response = requests.get(SYMBOLS_URL)
+    headers = {'Authorization': f'token {github_token}'}
+    response = requests.get(SYMBOLS_URL, headers=headers)
     response.raise_for_status()
 
     yaml = YAML(typ='safe')
@@ -149,7 +151,11 @@ def vol_table_flow():
     logger.info("=" * 60)
 
     api_token, aws_credentials = load_credentials()
-    symbols = fetch_symbols_from_github()
+
+    logger.info("Loading GitHub PAT from Prefect Cloud...")
+    github_token = Secret.load("github-pat-apex").get()
+
+    symbols = fetch_symbols_from_github(github_token)
 
     computed_at = datetime.now(timezone.utc)
     rows = []
