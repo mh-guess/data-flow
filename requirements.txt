@@ -1,5 +1,8 @@
-# AWS integration as a matched extra of the pre-installed prefect
-prefect[aws]
+# Pin prefect to work around broken 3.7.0 in managed work pool base image.
+# 3.7.0 has internal import inconsistency: task_engine.py references
+# _aget_default_persist_result which doesn't exist in results.py.
+# TODO: Remove pin once Prefect fixes the base image.
+prefect[aws]==3.6.29
 
 # Tiingo API integration
 requests>=2.31.0
