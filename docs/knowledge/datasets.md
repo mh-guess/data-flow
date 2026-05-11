@@ -191,6 +191,86 @@ Fetched daily. Changes infrequently (when companies restructure, reclassify, etc
 
 ---
 
+---
+
+## 6. APEX Volatility Table (`derived/volatility`)
+
+Computed trailing volatility metrics for the APEX trading symbol universe. Used by the APEX trade execution system to set limit order price thresholds calibrated to each stock's volatility.
+
+**Pipeline:** `vol_table_flow.py` (scheduled 6 PM ET weekdays)
+
+**Data source:** Tiingo EOD prices API (180 calendar days / ~122 trading days lookback, using `adjClose`)
+
+**Symbol source:** `symbols.yaml` from `mh-guess/apex` GitHub repo (fetched at runtime via PAT)
+
+### S3 Locations
+
+```
+s3://apex-market-data-raw-220464759930/derived/volatility/
+├── {YYYY-MM-DD}/vol_table.parquet    # Date-partitioned (retained for history)
+└── vol_table_latest.parquet          # Overwritten every run (use this for consumption)
+```
+
+**For downstream consumers:** read `vol_table_latest.parquet` — it always contains the most recent computation. Date-partitioned files are retained for debugging and auditing.
+
+### Schema
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `symbol` | string | Ticker symbol (e.g., "CRDO") |
+| `daily_vol` | float64 | Daily standard deviation of log returns (non-annualized) |
+| `daily_vol_annualized` | float64 | Annualized volatility (`daily_vol * sqrt(252)`) |
+| `per_minute_vol` | float64 | Estimated per-minute volatility (`daily_vol / sqrt(390)`) |
+| `lookback_days` | Int32 | Number of trading days actually used (typically ~122) |
+| `data_start_date` | date | First date in the lookback window |
+| `data_end_date` | date | Last date in the lookback window (prior trading day) |
+| `short_history` | bool | True if `lookback_days < 90` |
+| `no_data` | bool | True if ticker had zero data (all vol fields will be null) |
+| `computed_at` | timestamp (UTC) | When this row was computed |
+
+### Computation
+
+For each ticker, using ~122 trading days of adjusted close prices:
+
+1. Log returns: `ln(adjClose[t] / adjClose[t-1])`
+2. `daily_vol` = sample standard deviation of log returns (`ddof=1`)
+3. `daily_vol_annualized` = `daily_vol * sqrt(252)`
+4. `per_minute_vol` = `daily_vol / sqrt(390)` (390 = trading minutes per day)
+
+### Consuming the data
+
+```python
+import pandas as pd
+
+df = pd.read_parquet("s3://apex-market-data-raw-220464759930/derived/volatility/vol_table_latest.parquet")
+
+# Look up a ticker's per-minute volatility
+ticker_vol = df.loc[df['symbol'] == 'CRDO', 'per_minute_vol'].iloc[0]
+
+# Example: compute a limit price threshold
+limit_price = ask_price * (1 + N * ticker_vol)
+```
+
+### Frequency and timing
+
+- **Schedule:** 6 PM ET, Monday–Friday
+- **Runtime:** ~4 minutes (100 tickers × 2s rate limit + setup)
+- **Retention:** Date-partitioned files are kept indefinitely; `vol_table_latest.parquet` is overwritten each run
+
+### Edge cases
+
+- **`no_data = True`**: Ticker not found on Tiingo (e.g., `PBR.A` — share class suffix not supported). All vol fields are null. Consumer should fall back to a default threshold.
+- **`short_history = True`**: Ticker has fewer than 90 trading days of data (e.g., recent IPO). Vol is computed but may be less reliable.
+- **Adjusted close (`adjClose`)**: Used instead of raw `close` to prevent stock splits and dividends from creating artificial volatility spikes. Cross-validated against Alpaca SIP adjusted data (<0.5% difference).
+
+### Access
+
+- **S3 bucket:** `apex-market-data-raw-220464759930` (us-east-1)
+- **Read access:** Requires `s3:GetObject` on `derived/volatility/*`
+- **IAM:** Bucket policy managed in `apex/infra/main.tf`
+
+---
+
 ## Complete S3 Tree
 
 ```
@@ -211,8 +291,12 @@ s3://mh-guess-data/tiingo/json/
     │       └── load_type=retro/year={year}/{TICKER}.json
     ├── definitions/date={date}/definitions.json
     └── meta/date={date}/meta.json
+
+s3://apex-market-data-raw-220464759930/derived/volatility/
+├── {YYYY-MM-DD}/vol_table.parquet
+└── vol_table_latest.parquet
 ```
 
 ## Storage Format
 
-All files are raw Tiingo API responses stored as compact JSON (no indentation). One file per ticker per partition, except definitions and meta which are single files containing all tickers/metrics.
+Raw Tiingo data is stored as compact JSON (no indentation), one file per ticker per partition. Definitions and meta are single files containing all tickers/metrics. The volatility table is a single parquet file (snappy compression) with one row per ticker.

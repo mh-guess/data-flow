@@ -77,6 +77,20 @@ uvx prefect-cloud deploy tiingo_fundamentals_backfill_flow.py:tiingo_fundamental
   --from mh-guess/data-flow --with-requirements requirements.txt
 ```
 
+## Running APEX Volatility Table Pipeline
+
+```bash
+# Manual run
+uvx prefect-cloud run vol_table_flow/vol_table_flow
+```
+
+## Deploying APEX Volatility Table Pipeline
+
+```bash
+uvx prefect-cloud deploy vol_table_flow.py:vol_table_flow \
+  --from mh-guess/data-flow --with-requirements requirements.txt
+```
+
 ## Key Links
 
 - [Prefect Cloud Workspace](https://app.prefect.cloud/account/dd30d6c9-aba2-4983-bdb6-aa698e89e845/workspace/426a0775-66ec-4813-a87c-c00c1bd2550b)

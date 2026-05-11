@@ -3,16 +3,19 @@
 ## System Overview
 
 ```
-Tiingo REST API
-      │
-      ▼
-┌─────────────┐       ┌──────────────┐
-│ Prefect Cloud│──────▶│ AWS S3       │
-│ (orchestrate)│       │ (mh-guess-data)
-└─────────────┘       └──────────────┘
-      │
-      ├── tiingo_to_s3_flow    (daily, scheduled)
-      └── tiingo_backfill_flow (retro, on-demand)
+Tiingo REST API       GitHub (mh-guess/apex)
+      │                      │
+      ▼                      ▼ symbols.yaml
+┌─────────────┐       ┌──────────────────────────────────┐
+│ Prefect Cloud│──────▶│ AWS S3                           │
+│ (orchestrate)│       │ mh-guess-data (raw JSON)         │
+└─────────────┘       │ apex-market-data-raw (derived)    │
+      │               └──────────────────────────────────┘
+      ├── tiingo_to_s3_flow         (daily, 6 PM PT)
+      ├── tiingo_backfill_flow      (retro, on-demand)
+      ├── tiingo_fundamentals_flow  (daily, 6 PM PT)
+      ├── tiingo_fundamentals_backfill_flow (on-demand)
+      └── vol_table_flow            (daily, 6 PM ET)
 ```
 
 ## Shared Module (`shared.py`)
@@ -61,6 +64,16 @@ Scheduled at 6 PM Pacific on weekdays. Per-run: 2 + (3 x num_tickers) API calls.
 
 Rate limited at 3s between calls (~20/min). Run on-demand.
 
+### APEX Volatility Table (`vol_table_flow.py`)
+
+1. Load credentials (Tiingo token, AWS creds, GitHub PAT)
+2. Fetch symbol list from `mh-guess/apex` repo on GitHub (via PAT auth)
+3. For each symbol: call Tiingo API for 180 calendar days of EOD prices
+4. Compute log-return volatility metrics (daily, annualized, per-minute)
+5. Write parquet to `s3://apex-market-data-raw-220464759930/derived/volatility/`
+
+Rate limited at 2s between calls. Scheduled at 6 PM Eastern on weekdays. Writes both a date-partitioned file and a `vol_table_latest.parquet` overwritten each run.
+
 ## S3 Data Layout
 
 ```
@@ -97,8 +110,11 @@ s3://mh-guess-data/tiingo/json/
 
 All secrets stored in Prefect Cloud blocks (never in code or env vars):
 - `tiingo-api-token` (Secret block) -- Tiingo API key
-- `aws-credentials-tim` (AwsCredentials block) -- AWS access for S3
+- `aws-credentials-tim` (AwsCredentials block) -- AWS access for S3 (both buckets)
+- `github-pat-apex` (Secret block) -- GitHub classic PAT with `repo` scope for reading `symbols.yaml` from `mh-guess/apex`
 
 ## Ticker Management
 
-Tickers are read dynamically from `s3://mh-guess-data/adhoc/tickers.txt` at runtime. To add or remove tickers, edit that file directly -- no code changes or redeployment needed.
+**Tiingo pipelines:** Tickers are read dynamically from `s3://mh-guess-data/adhoc/tickers.txt` at runtime. To add or remove tickers, edit that file directly -- no code changes or redeployment needed.
+
+**Vol table pipeline:** Tickers are read from `symbols.yaml` in the `mh-guess/apex` GitHub repo (`main` branch) at runtime. To update, commit changes to `symbols.yaml` in the APEX repo -- no changes needed in data-flow.
