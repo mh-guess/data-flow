@@ -175,5 +175,43 @@ deployments:
       - boto3>=1.29.0
       - prefect-aws>=0.4.0
 
+  - name: apex-vol-table-daily
+    description: "Daily volatility table for APEX trading system (per-minute vol estimates)"
+    version: 1.0.0
+    tags:
+      - etl
+      - apex
+      - volatility
+      - s3
+      - production
+
+    entrypoint: vol_table_flow.py:vol_table_flow
+
+    schedules:
+      - cron: "0 18 * * 1-5"
+        timezone: "America/New_York"
+        active: true
+
+    work_pool:
+      name: "default-agent-pool"
+
+    build: null
+
+    push:
+      - prefect.deployments.steps.git_clone:
+          repository: https://github.com/mh-guess/data-flow.git
+          branch: main
+
+    pull:
+      - prefect.deployments.steps.git_clone:
+          repository: https://github.com/mh-guess/data-flow.git
+          branch: main
+
+    requirements:
+      - prefect>=2.14.0
+      - requests>=2.31.0
+      - boto3>=1.29.0
+      - prefect-aws>=0.4.0
+
 # Global configuration
 name: tiingo-data-pipeline

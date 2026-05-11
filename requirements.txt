@@ -6,3 +6,8 @@ prefect[aws]==3.6.29
 
 # Tiingo API integration
 requests>=2.31.0
+
+# Volatility table pipeline
+pandas>=2.0.0
+pyarrow>=14.0.0
+ruamel.yaml>=0.18.0
