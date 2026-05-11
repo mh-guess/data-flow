@@ -1,5 +1,10 @@
+# Pin prefect to override the managed work pool base image version.
+# The base image uses a floating tag that can break between releases.
+# See: https://github.com/PrefectHQ/prefect/issues/18394
+prefect==3.6.29
+
 # Tiingo API integration
 requests>=2.31.0
 
-# AWS S3 integration (prefect-aws installs boto3 automatically)
+# AWS S3 integration
 prefect-aws>=0.5.0
