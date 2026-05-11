@@ -186,12 +186,14 @@ def vol_table_flow():
     s3_key = f"derived/volatility/{date_partition}/vol_table.parquet"
 
     s3_client = aws_credentials.get_boto3_session().client('s3')
-    s3_client.put_object(
-        Bucket=APEX_BUCKET,
-        Key=s3_key,
-        Body=parquet_bytes,
-        ContentType='application/x-parquet',
-    )
+    latest_key = "derived/volatility/vol_table_latest.parquet"
+    for key in [s3_key, latest_key]:
+        s3_client.put_object(
+            Bucket=APEX_BUCKET,
+            Key=key,
+            Body=parquet_bytes,
+            ContentType='application/x-parquet',
+        )
 
     no_data_count = sum(1 for r in rows if r['no_data'])
     short_count = sum(1 for r in rows if r['short_history'])
@@ -205,6 +207,7 @@ def vol_table_flow():
     if failed > 0:
         logger.warning(f"  API failures (included as no_data): {failed}")
     logger.info(f"Output: s3://{APEX_BUCKET}/{s3_key}")
+    logger.info(f"Latest: s3://{APEX_BUCKET}/{latest_key}")
     logger.info(f"File size: {len(parquet_bytes):,} bytes")
     logger.info("=" * 60)
 

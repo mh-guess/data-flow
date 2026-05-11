@@ -2,6 +2,43 @@
 
 *Last updated: 2026-05-11*
 
+## Session: 2026-05-11 (APEX volatility table pipeline)
+
+### New pipeline: `vol_table_flow.py`
+- Computes trailing volatility metrics (daily vol, annualized vol, per-minute vol) for the APEX symbol universe
+- Fetches symbols from `mh-guess/apex` repo via GitHub API (classic PAT stored in `github-pat-apex` Prefect Secret block)
+- Fetches 180 calendar days (~122 trading days) of EOD OHLCV from Tiingo API per ticker
+- Uses `adjClose` (split/dividend adjusted) for log return calculation
+- Writes parquet to `s3://apex-market-data-raw-220464759930/derived/volatility/{date}/vol_table.parquet` + a `vol_table_latest.parquet` overwritten each run
+- Scheduled 6 PM ET weekdays (`America/New_York`)
+- Deployed as 5th (final) Prefect Cloud deployment slot
+
+### Validation against Alpaca SIP data
+Cross-validated volatility output against Alpaca's `StockHistoricalDataClient` using `Adjustment.ALL` (split+dividend adjusted) and `DataFeed.SIP` (consolidated tape). Results for 5 tickers:
+
+| Symbol | Tiingo Vol | Alpaca Vol | Diff |
+|--------|-----------|-----------|------|
+| MU | 0.7357 | 0.7372 | 0.21% |
+| CRDO | 0.9054 | 0.9027 | 0.30% |
+| AMD | 0.6813 | 0.6777 | 0.52% |
+| DELL | 0.6166 | 0.6174 | 0.13% |
+| FDX | 0.2906 | 0.2904 | 0.07% |
+
+All within <1%. Residual differences are from minor variations in how Tiingo (multi-exchange aggregated EOD) and Alpaca (SIP consolidated tape) compute adjusted prices.
+
+### Key decisions
+- **adjClose over close**: prevents stock splits and dividends from creating artificial volatility spikes
+- **GitHub PAT for symbols**: classic PAT with `repo` scope (fine-grained PATs require org opt-in for `mh-guess` org)
+- **Tiingo data source**: EOD prices are aggregated from 3 exchanges (not IEX-only; IEX direct is only for their real-time product)
+
+### First run results
+- 100 symbols processed (symbols.yaml has grown from original 51)
+- 99 valid, 1 no_data (`PBR.A` — Tiingo doesn't support `.A` share class suffix)
+- 122 trading days per ticker, annualized vol range: 0.231–1.564
+- Output: 9,793 bytes parquet
+
+---
+
 ## Session: 2026-05-11 (production cleanup)
 
 ### Completed all 5 production action items

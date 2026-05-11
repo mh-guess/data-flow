@@ -10,6 +10,7 @@
 | EOD Backfill | `tiingo_backfill_flow.py` | On-demand | Completed for 2020-2025 |
 | Fundamentals Daily | `tiingo_fundamentals_flow.py` | 6 PM weekdays (Pacific) | Active, scheduled |
 | Fundamentals Backfill | `tiingo_fundamentals_backfill_flow.py` | On-demand | Verify `belligerent-taipan` completed (see below) |
+| APEX Vol Table | `vol_table_flow.py` | 6 PM weekdays (Eastern) | Active, scheduled |
 
 ## Action Items for Next Person
 
@@ -31,11 +32,11 @@ uvx prefect-cloud run test_flow/test_flow
 ## Infrastructure
 
 - **Orchestration**: Prefect Cloud (managed work pool: `default-work-pool`)
-- **Credentials**: Prefect Cloud blocks (`tiingo-api-token`, `aws-credentials-tim`)
-- **Storage**: AWS S3 (`mh-guess-data` bucket)
-- **Ticker config**: `s3://mh-guess-data/adhoc/tickers.txt` (104 tickers)
+- **Credentials**: Prefect Cloud blocks (`tiingo-api-token`, `aws-credentials-tim`, `github-pat-apex`)
+- **Storage**: AWS S3 (`mh-guess-data` for raw data, `apex-market-data-raw-220464759930` for derived)
+- **Ticker config**: `s3://mh-guess-data/adhoc/tickers.txt` (104 tickers for Tiingo pipelines); `mh-guess/apex:symbols.yaml` (100 tickers for vol table)
 - **Source**: GitHub (`mh-guess/data-flow`, deploys from `main` branch)
-- **Deployment slots**: 4 of 5 used (1 free after test deployment cleanup)
+- **Deployment slots**: 5 of 5 used
 
 ## Data in S3
 
