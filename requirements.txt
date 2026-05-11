@@ -1,9 +1,5 @@
-# Core dependencies
-prefect>=3.7.0
-
-# For Tiingo API integration
+# Tiingo API integration
 requests>=2.31.0
 
-# For AWS S3 integration
-boto3>=1.29.0
-prefect-aws>=0.7.0
+# AWS S3 integration (prefect-aws installs boto3 automatically)
+prefect-aws>=0.5.0
