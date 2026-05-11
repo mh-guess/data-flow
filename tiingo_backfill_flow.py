@@ -4,54 +4,20 @@ Tiingo Historical Data Backfill Pipeline
 Fetches historical price data from Tiingo API and loads to S3 with year-level partitioning.
 Uses type-partitioned structure for efficient querying and processing.
 
-S3 Structure: s3://mh-guess-data/tiingo/json/load_type=retro/year={YYYY}/{ticker}.json
+S3 Structure: s3://mh-guess-data/tiingo/json/price_eod/load_type=retro/year={YYYY}/{ticker}.json
 
 Each file contains all trading days for that ticker in that year (~252 records).
 This minimizes API calls: 1 call per ticker per year instead of 1 per day.
 """
 
 from prefect import flow, task, get_run_logger
-from prefect.blocks.system import Secret
-from prefect_aws import AwsCredentials
 from datetime import datetime
 import requests
 import json
 from typing import Optional, List
 
-
-# Configuration
-S3_BUCKET_NAME = "mh-guess-data"
-TICKERS_S3_KEY = "adhoc/tickers.txt"
-
-
-@task(retries=2, retry_delay_seconds=5)
-def fetch_tickers_from_s3(bucket_name: str, s3_key: str, aws_credentials: AwsCredentials) -> list:
-    """
-    Fetch ticker list from S3 file.
-
-    Args:
-        bucket_name: S3 bucket name
-        s3_key: S3 key for the tickers file
-        aws_credentials: AWS credentials from Prefect Cloud
-
-    Returns:
-        List of ticker symbols
-    """
-    logger = get_run_logger()
-    logger.info(f"Fetching tickers from s3://{bucket_name}/{s3_key}...")
-
-    # Get S3 client using AWS credentials from Prefect Cloud
-    s3_client = aws_credentials.get_boto3_session().client('s3')
-
-    # Fetch the tickers file
-    response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
-    tickers_content = response['Body'].read().decode('utf-8')
-
-    # Parse tickers (one per line, strip whitespace)
-    tickers = [line.strip() for line in tickers_content.strip().split('\n') if line.strip()]
-
-    logger.info(f"Loaded {len(tickers)} tickers: {', '.join(tickers)}")
-    return tickers
+from prefect_aws import AwsCredentials
+from shared import S3_BUCKET_NAME, TICKERS_S3_KEY, fetch_tickers_from_s3, load_credentials
 
 
 @task(retries=3, retry_delay_seconds=10)
@@ -121,8 +87,7 @@ def load_year_to_s3(
     year = ticker_year_data["year"]
     data = ticker_year_data["data"]
 
-    # Create S3 key: tiingo/json/load_type=retro/year={YYYY}/{ticker}.json
-    s3_key = f"tiingo/json/load_type=retro/year={year}/{ticker}.json"
+    s3_key = f"tiingo/json/price_eod/load_type=retro/year={year}/{ticker}.json"
 
     logger.info(f"Loading {ticker} {year} data ({len(data)} records) to S3...")
 
@@ -177,12 +142,7 @@ def tiingo_backfill_flow(
     logger.info("="*60)
 
     # Load credentials from Prefect Cloud Blocks
-    logger.info("Loading Tiingo API token from Prefect Cloud...")
-    tiingo_token_block = Secret.load("tiingo-api-token")
-    api_token = tiingo_token_block.get()
-
-    logger.info("Loading AWS credentials from Prefect Cloud...")
-    aws_credentials = AwsCredentials.load("aws-credentials-tim")
+    api_token, aws_credentials = load_credentials()
 
     # Fetch tickers
     if tickers is None:
@@ -214,7 +174,7 @@ def tiingo_backfill_flow(
     logger.info(f"Total files uploaded: {len(uploaded_keys)}")
     logger.info(f"Years processed: {start_year}-{end_year}")
     logger.info(f"Tickers processed: {', '.join(tickers)}")
-    logger.info(f"Data location: s3://{S3_BUCKET_NAME}/tiingo/json/load_type=retro/")
+    logger.info(f"Data location: s3://{S3_BUCKET_NAME}/tiingo/json/price_eod/load_type=retro/")
     logger.info("="*60)
 
     return {

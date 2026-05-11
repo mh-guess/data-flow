@@ -117,8 +117,8 @@ prefect deployment run tiingo-backfill \
 ```
 
 **Data Structure**:
-- Daily flow: `s3://mh-guess-data/tiingo/json/load_type=daily/date={YYYY-MM-DD}/{ticker}.json`
-- Backfill flow: `s3://mh-guess-data/tiingo/json/load_type=retro/year={YYYY}/{ticker}.json`
+- Daily flow: `s3://mh-guess-data/tiingo/json/price_eod/load_type=daily/date={YYYY-MM-DD}/{ticker}.json`
+- Backfill flow: `s3://mh-guess-data/tiingo/json/price_eod/load_type=retro/year={YYYY}/{ticker}.json`
 
 **API Efficiency**:
 - 5-year backfill for 5 tickers = 25 API calls (1 per ticker per year)

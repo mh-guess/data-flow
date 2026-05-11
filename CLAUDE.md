@@ -18,21 +18,27 @@ Production ETL system for loading financial data from Tiingo API to AWS S3 using
 
 ### 📊 Data Architecture
 
-**Type-Partitioned Structure** (hybrid granularity):
+**Source-Partitioned Structure** (hybrid granularity):
 ```
 s3://mh-guess-data/tiingo/json/
-├── load_type=daily/
-│   └── date=2025-01-15/
-│       ├── AAPL.json      # Single day of data
-│       ├── TSLA.json
-│       └── ...
-└── load_type=retro/
-    ├── year=2020/
-    │   ├── AAPL.json      # ~252 days of data
-    │   ├── TSLA.json
-    │   └── ...
-    ├── year=2021/
-    └── year=2025/
+├── price_eod/                    # End-of-day price data
+│   ├── load_type=daily/
+│   │   └── date=2025-01-15/
+│   │       ├── AAPL.json         # Single day of data
+│   │       ├── TSLA.json
+│   │       └── ...
+│   └── load_type=retro/
+│       ├── year=2020/
+│       │   ├── AAPL.json         # ~252 days of data
+│       │   ├── TSLA.json
+│       │   └── ...
+│       ├── year=2021/
+│       └── year=2025/
+└── fundamentals/
+    ├── daily/                    # Daily fundamental metrics (P/E, market cap, etc.)
+    ├── statements/               # Financial statements (as_reported=true & false)
+    ├── definitions/              # Metric definitions (reference data)
+    └── meta/                     # Company metadata (sector, industry, etc.)
 ```
 
 **Key Design Decisions**:
@@ -62,9 +68,13 @@ prefect cloud login
 ## Key Files
 
 ### Pipeline Files
-- **tiingo_to_s3_flow.py**: Daily incremental ETL pipeline
-- **tiingo_backfill_flow.py**: Historical backfill pipeline (year-partitioned)
-- **prefect.yaml**: Infrastructure as Code for deployments
+- **shared.py**: Shared utilities (credentials, ticker loading, S3 upload, constants)
+- **tiingo_to_s3_flow.py**: Daily incremental EOD price pipeline
+- **tiingo_backfill_flow.py**: Historical EOD price backfill (year-partitioned)
+- **tiingo_fundamentals_flow.py**: Daily fundamentals pipeline (metrics, statements, definitions, meta)
+- **tiingo_fundamentals_backfill_flow.py**: Historical fundamentals backfill with rate limiting
+- **migrate_s3_eod_prefix.py**: One-time S3 migration script (run locally, not deployed)
+- **prefect.yaml**: Infrastructure as Code for deployments (4 deployments)
 - **requirements.txt**: Python dependencies
 
 ### Documentation
@@ -136,13 +146,13 @@ See `SETUP.md` for detailed setup instructions.
 1. Load credentials from Prefect Cloud blocks
 2. Fetch tickers from `s3://mh-guess-data/adhoc/tickers.txt`
 3. For each ticker: fetch last 30 days from Tiingo API
-4. Save raw data to `s3://mh-guess-data/tiingo/json/load_type=daily/date={YYYY-MM-DD}/{ticker}.json`
+4. Save raw data to `s3://mh-guess-data/tiingo/json/price_eod/load_type=daily/date={YYYY-MM-DD}/{ticker}.json`
 
 ### Backfill Pipeline Flow
 1. Load credentials from Prefect Cloud blocks
 2. Fetch tickers from S3 (or use provided list)
 3. For each ticker × year: fetch entire year in 1 API call
-4. Save raw data to `s3://mh-guess-data/tiingo/json/load_type=retro/year={YYYY}/{ticker}.json`
+4. Save raw data to `s3://mh-guess-data/tiingo/json/price_eod/load_type=retro/year={YYYY}/{ticker}.json`
 
 ### API Efficiency
 - **Backfill**: 1 call per ticker per year (e.g., 5 tickers × 5 years = 25 calls)

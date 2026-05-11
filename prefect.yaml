@@ -98,5 +98,82 @@ deployments:
       - boto3>=1.29.0
       - prefect-aws>=0.4.0
 
+  - name: tiingo-fundamentals-daily
+    description: "Daily pipeline for Tiingo fundamentals (daily metrics, statements, definitions, meta)"
+    version: 1.0.0
+    tags:
+      - etl
+      - tiingo
+      - fundamentals
+      - s3
+      - production
+
+    entrypoint: tiingo_fundamentals_flow.py:tiingo_fundamentals_flow
+
+    schedules:
+      - cron: "0 18 * * 1-5"
+        timezone: "America/Los_Angeles"
+        active: true
+
+    work_pool:
+      name: "default-agent-pool"
+
+    build: null
+
+    push:
+      - prefect.deployments.steps.git_clone:
+          repository: https://github.com/mh-guess/data-flow.git
+          branch: main
+
+    pull:
+      - prefect.deployments.steps.git_clone:
+          repository: https://github.com/mh-guess/data-flow.git
+          branch: main
+
+    requirements:
+      - prefect>=2.14.0
+      - requests>=2.31.0
+      - boto3>=1.29.0
+      - prefect-aws>=0.4.0
+
+  - name: tiingo-fundamentals-backfill
+    description: "On-demand historical fundamentals backfill with year-level partitioning"
+    version: 1.0.0
+    tags:
+      - backfill
+      - tiingo
+      - fundamentals
+      - s3
+      - historical
+
+    entrypoint: tiingo_fundamentals_backfill_flow.py:tiingo_fundamentals_backfill_flow
+
+    schedules: []
+
+    parameters:
+      start_year: 2020
+      end_year: 2024
+
+    work_pool:
+      name: "default-agent-pool"
+
+    build: null
+
+    push:
+      - prefect.deployments.steps.git_clone:
+          repository: https://github.com/mh-guess/data-flow.git
+          branch: main
+
+    pull:
+      - prefect.deployments.steps.git_clone:
+          repository: https://github.com/mh-guess/data-flow.git
+          branch: main
+
+    requirements:
+      - prefect>=2.14.0
+      - requests>=2.31.0
+      - boto3>=1.29.0
+      - prefect-aws>=0.4.0
+
 # Global configuration
 name: tiingo-data-pipeline

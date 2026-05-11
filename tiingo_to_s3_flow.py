@@ -4,52 +4,18 @@ Tiingo to S3 Daily ETL Pipeline
 Fetches daily price data from Tiingo API and loads it to AWS S3.
 Uses Prefect Cloud Blocks for secure credential management.
 
-S3 Structure: s3://mh-guess-data/tiingo/json/load_type=daily/date={YYYY-MM-DD}/{ticker}.json
+S3 Structure: s3://mh-guess-data/tiingo/json/price_eod/load_type=daily/date={YYYY-MM-DD}/{ticker}.json
 
 This is the incremental daily pipeline. For historical backfills, see tiingo_backfill_flow.py.
 """
 
 from prefect import flow, task, get_run_logger
-from prefect.blocks.system import Secret
-from prefect_aws import AwsCredentials
 from datetime import datetime, timedelta
 import requests
 import json
 
-
-# Configuration
-S3_BUCKET_NAME = "mh-guess-data"
-TICKERS_S3_KEY = "adhoc/tickers.txt"
-
-
-@task(retries=2, retry_delay_seconds=5)
-def fetch_tickers_from_s3(bucket_name: str, s3_key: str, aws_credentials: AwsCredentials) -> list:
-    """
-    Fetch ticker list from S3 file.
-
-    Args:
-        bucket_name: S3 bucket name
-        s3_key: S3 key for the tickers file
-        aws_credentials: AWS credentials from Prefect Cloud
-
-    Returns:
-        List of ticker symbols
-    """
-    logger = get_run_logger()
-    logger.info(f"Fetching tickers from s3://{bucket_name}/{s3_key}...")
-
-    # Get S3 client using AWS credentials from Prefect Cloud
-    s3_client = aws_credentials.get_boto3_session().client('s3')
-
-    # Fetch the tickers file
-    response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
-    tickers_content = response['Body'].read().decode('utf-8')
-
-    # Parse tickers (one per line, strip whitespace)
-    tickers = [line.strip() for line in tickers_content.strip().split('\n') if line.strip()]
-
-    logger.info(f"Loaded {len(tickers)} tickers: {', '.join(tickers)}")
-    return tickers
+from prefect_aws import AwsCredentials
+from shared import S3_BUCKET_NAME, TICKERS_S3_KEY, fetch_tickers_from_s3, load_credentials
 
 
 @task(retries=3, retry_delay_seconds=10)
@@ -179,8 +145,7 @@ def load_to_s3(ticker_data_list: list, bucket_name: str, aws_credentials: AwsCre
         ticker = ticker_data["ticker"]
         raw_data = ticker_data["data"]  # Raw data from Tiingo API
 
-        # Create S3 key: tiingo/json/load_type=daily/date={YYYY-MM-DD}/{ticker}.json
-        s3_key = f"tiingo/json/load_type=daily/date={date_partition}/{ticker}.json"
+        s3_key = f"tiingo/json/price_eod/load_type=daily/date={date_partition}/{ticker}.json"
 
         # Save raw data as-is (compact JSON, no pretty formatting)
         json_data = json.dumps(raw_data)
@@ -212,12 +177,7 @@ def tiingo_to_s3_flow():
     logger.info("="*60)
 
     # Load credentials from Prefect Cloud Blocks
-    logger.info("Loading Tiingo API token from Prefect Cloud...")
-    tiingo_token_block = Secret.load("tiingo-api-token")
-    api_token = tiingo_token_block.get()
-
-    logger.info("Loading AWS credentials from Prefect Cloud...")
-    aws_credentials = AwsCredentials.load("aws-credentials-tim")
+    api_token, aws_credentials = load_credentials()
 
     # Fetch tickers from S3
     tickers = fetch_tickers_from_s3(S3_BUCKET_NAME, TICKERS_S3_KEY, aws_credentials)
