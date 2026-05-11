@@ -2,6 +2,17 @@
 
 *Last updated: 2026-05-11*
 
+## Session: 2026-05-11 (production cleanup)
+
+### Completed all 5 production action items
+1. Redeployed all 4 production pipelines with final `prefect[aws]==3.6.29` requirements
+2. Deleted test deployment (freed 1 of 5 deployment slots)
+3. Set daily schedules for EOD and fundamentals pipelines (`0 18 * * 1-5`, America/Los_Angeles)
+4. Verified fundamentals backfill (`belligerent-taipan`) ~90% complete with 0 failures as of 17:17 UTC
+5. Deleted old S3 paths (`tiingo/json/load_type=daily/` and `tiingo/json/load_type=retro/`) after verifying object counts match new `price_eod/` paths
+
+---
+
 ## Session: 2026-05-08 to 2026-05-11
 
 ### Documentation & Organization

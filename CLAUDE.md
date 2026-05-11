@@ -8,6 +8,8 @@ Production ETL system for loading financial data from Tiingo API to AWS S3 using
 1. **Daily incremental pipeline** - Scheduled to run 6 PM weekdays (Pacific Time)
 2. **Historical backfill pipeline** - On-demand for loading historical data
 
+**NOTE: use the prefect MCP to gather real data and context for analysis, deployment, and troubleshoots.**
+
 ## Current Status (as of session end)
 
 ### ✅ Deployed & Running

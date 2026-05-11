@@ -6,64 +6,26 @@
 
 | Pipeline | File | Schedule | Status |
 |----------|------|----------|--------|
-| EOD Daily | `tiingo_to_s3_flow.py` | 6 PM weekdays (Pacific) | Needs redeploy (see below) |
+| EOD Daily | `tiingo_to_s3_flow.py` | 6 PM weekdays (Pacific) | Active, scheduled |
 | EOD Backfill | `tiingo_backfill_flow.py` | On-demand | Completed for 2020-2025 |
-| Fundamentals Daily | `tiingo_fundamentals_flow.py` | 6 PM weekdays (Pacific) | Needs redeploy (see below) |
-| Fundamentals Backfill | `tiingo_fundamentals_backfill_flow.py` | On-demand | Running (2020-2025, 1,872 API calls) |
-| Test Flow | `test_flow.py` | None | Passed -- delete deployment when done |
+| Fundamentals Daily | `tiingo_fundamentals_flow.py` | 6 PM weekdays (Pacific) | Active, scheduled |
+| Fundamentals Backfill | `tiingo_fundamentals_backfill_flow.py` | On-demand | Verify `belligerent-taipan` completed (see below) |
 
 ## Action Items for Next Person
 
-### 1. Redeploy all 4 production pipelines with final requirements
+### 1. Verify the fundamentals backfill completed
 
-The backfill that's currently running was deployed with `prefect==3.6.29` (old standalone `prefect-aws`). The final requirements use `prefect[aws]==3.6.29` (built-in extra). All 4 production deployments need to be redeployed:
-
-```bash
-uvx prefect-cloud deploy tiingo_to_s3_flow.py:tiingo_to_s3_flow --from mh-guess/data-flow --with-requirements requirements.txt
-uvx prefect-cloud deploy tiingo_backfill_flow.py:tiingo_backfill_flow --from mh-guess/data-flow --with-requirements requirements.txt
-uvx prefect-cloud deploy tiingo_fundamentals_flow.py:tiingo_fundamentals_flow --from mh-guess/data-flow --with-requirements requirements.txt
-uvx prefect-cloud deploy tiingo_fundamentals_backfill_flow.py:tiingo_fundamentals_backfill_flow --from mh-guess/data-flow --with-requirements requirements.txt
-```
-
-### 2. Delete test deployment to free up a slot
-
-We're at the 5-deployment limit. After redeployment, delete the test flow:
-
-```bash
-uvx prefect-cloud delete test_flow/test_flow
-```
-
-### 3. Set schedules for the daily pipelines
-
-The deployments were created via `prefect-cloud deploy` which doesn't carry over the schedule from `prefect.yaml`. Set schedules manually:
-
-```bash
-uvx prefect-cloud schedule tiingo_to_s3_flow/tiingo_to_s3_flow "0 18 * * 1-5"
-uvx prefect-cloud schedule tiingo_fundamentals_flow/tiingo_fundamentals_flow "0 18 * * 1-5"
-```
-
-### 4. Verify the fundamentals backfill completed
-
-Check the `belligerent-taipan` flow run in Prefect Cloud. It's processing 104 tickers x 6 years x 3 endpoints = 1,872 API calls at 3s each (~90 min total). Started ~15:52 UTC on May 11.
-
-### 5. Clean up old S3 paths
-
-After confirming the EOD daily pipeline writes to the new `price_eod/` path on its next successful scheduled run, delete the old objects:
-
-```bash
-aws s3 rm s3://mh-guess-data/tiingo/json/load_type=daily/ --recursive
-aws s3 rm s3://mh-guess-data/tiingo/json/load_type=retro/ --recursive
-```
+Check the `belligerent-taipan` flow run in Prefect Cloud. It was processing 104 tickers x 6 years x 3 endpoints = 1,872 API calls at 3s each (~90 min total). Started ~15:52 UTC on May 11. As of 17:17 UTC it was ~90% done with 0 failures.
 
 ## Known Issue: Prefect Version Pin
 
-**`requirements.txt` pins `prefect[aws]==3.6.29`.** This is a workaround for a broken prefect 3.7.0 in the managed work pool base image (see `docs/knowledge/decisions.md` for full context). When Prefect releases a fix, test with `test_flow.py` before bumping:
+**`requirements.txt` pins `prefect[aws]==3.6.29`.** This is a workaround for a broken prefect 3.7.0 in the managed work pool base image (see `docs/knowledge/decisions.md` for full context). When Prefect releases a fix, test with `test_flow.py` before bumping. Note: the test deployment was deleted to free up a slot -- recreate it first:
 
 ```bash
-# Update requirements.txt to new version, then:
 uvx prefect-cloud deploy test_flow.py:test_flow --from mh-guess/data-flow --with-requirements requirements.txt
 uvx prefect-cloud run test_flow/test_flow
 # Check flow run status in Prefect Cloud. If it passes, redeploy all production pipelines.
+# Then delete the test deployment again to stay under the limit.
 ```
 
 ## Infrastructure
@@ -73,7 +35,7 @@ uvx prefect-cloud run test_flow/test_flow
 - **Storage**: AWS S3 (`mh-guess-data` bucket)
 - **Ticker config**: `s3://mh-guess-data/adhoc/tickers.txt` (104 tickers)
 - **Source**: GitHub (`mh-guess/data-flow`, deploys from `main` branch)
-- **Deployment limit**: 5 (current tier)
+- **Deployment slots**: 4 of 5 used (1 free after test deployment cleanup)
 
 ## Data in S3
 
