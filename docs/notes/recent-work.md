@@ -1,16 +1,52 @@
 # Recent Work
 
-*Last updated: 2026-05-08*
+*Last updated: 2026-05-11*
 
-## Completed (reverse chronological)
+## Session: 2026-05-08 to 2026-05-11
 
-1. **CLAUDE.md project summary** -- Documented full project state for future sessions
-2. **Prefect logger migration** -- Replaced all `print()` with `get_run_logger()` for Prefect Cloud visibility
-3. **Historical backfill pipeline** -- Built `tiingo_backfill_flow.py` with year-level partitioning, ran backfills for 2020-2025
-4. **Removed example flow** -- Cleaned up starter code
-5. **Infrastructure as Code** -- Added `prefect.yaml` for deployment management
-6. **Compact JSON** -- Removed pretty formatting to save S3 storage
-7. **Raw data preservation** -- Stopped transforming Tiingo responses, save as-is
-8. **Dynamic tickers** -- Moved ticker list to S3 (`adhoc/tickers.txt`) instead of hardcoding
-9. **Date-based partitioning** -- Refactored S3 folder structure for queryability
-10. **Initial pipeline** -- Built daily Tiingo-to-S3 ETL with Prefect Cloud integration
+### Documentation & Organization
+- Created `docs/notes/` (short-term context) and `docs/knowledge/` (long-term reference)
+- Seeded initial docs: architecture, design decisions, operations runbook, status, backlog
+- Established decision log under `docs/knowledge/decisions.md`
+- Created `docs/knowledge/datasets.md` with full schema documentation for all 5 datasets
+
+### S3 Restructure (Phase 1)
+- Extracted shared utilities into `shared.py` (credentials, ticker loading, S3 upload)
+- Added `price_eod/` prefix to existing EOD price S3 paths
+- Updated `tiingo_to_s3_flow.py` and `tiingo_backfill_flow.py` to import from shared module
+- Created and ran `migrate_s3_eod_prefix.py` to copy 12,274 existing S3 objects to new paths
+- Migration verified: object counts match at old and new paths
+
+### Fundamentals Pipelines (Phase 2)
+- Created `tiingo_fundamentals_flow.py`: daily scheduled pipeline for all 4 Tiingo fundamentals endpoints (definitions, meta, daily metrics, statements with both `asReported` variants)
+- Created `tiingo_fundamentals_backfill_flow.py`: on-demand historical backfill with 3s rate limiting between API calls
+- Added 2 new deployments to `prefect.yaml`
+- Verified all 4 API endpoints return data (definitions: 85 metrics, meta: company info, daily: 5 ratios, statements: 76 fields across 4 sections)
+- Created `test_flow.py` for validating the managed work pool environment without touching production data
+
+### Prefect Version Conflict (Debugging & Fix)
+- **Root cause discovered**: The standalone `prefect-aws` package was archived in March 2026 and folded into the main `prefect` package. Installing the archived package on top of Prefect Cloud's managed work pool base image caused internal import conflicts (`_aget_default_persist_result` missing from `prefect.results`).
+- **Contributing factor**: Prefect 3.7.0 was released May 6 and the managed work pool base image updated to it. The combination of the new base image + archived `prefect-aws` package created the inconsistency.
+- **Fix**: Replaced `prefect-aws>=0.4.0` with `prefect[aws]==3.6.29` in requirements.txt. This uses the built-in AWS integration extra (matched to the prefect version) and pins to 3.6.29 to avoid the broken 3.7.0 base image.
+- **Verified**: Test flow passed all checks (S3 access, Tiingo API, credential loading) with the new requirements.
+- This also fixed the pre-existing EOD daily pipeline failures that had been occurring since May 7.
+
+### Deployment Status
+- All 4 production pipelines deployed to Prefect Cloud
+- Fundamentals backfill (2020-2025) running: 104 tickers x 6 years x 3 endpoints = 1,872 API calls
+- 4 production deployments need redeployment with final `prefect[aws]==3.6.29` requirements (currently deployed with interim `prefect==3.6.29`)
+
+---
+
+## Prior Work (before this session)
+
+1. CLAUDE.md project summary
+2. Prefect logger migration (`print()` -> `get_run_logger()`)
+3. Historical backfill pipeline with year-level partitioning
+4. Removed example flow
+5. Infrastructure as Code (`prefect.yaml`)
+6. Compact JSON storage
+7. Raw data preservation (no transformation)
+8. Dynamic tickers from S3
+9. Date-based partitioning
+10. Initial Tiingo-to-S3 ETL pipeline
