@@ -60,3 +60,18 @@
 **Verification:** Created `test_flow.py` that validates imports, S3 access, and Tiingo API access without touching production data. Passed all checks with `prefect[aws]==3.6.29`.
 
 **Revisit signal:** Periodically test newer prefect versions using `test_flow.py`. When a version works, bump the pin. File a bug report with Prefect about the 3.7.0 issue.
+
+## 2026-05-17: Migrate to `prefect deploy` from `uvx prefect-cloud deploy`
+
+**Context:** The vol table pipeline's schedule kept disappearing after redeployments. Investigation revealed that `uvx prefect-cloud deploy` ignores `prefect.yaml` entirely — it doesn't apply schedules, tags, or descriptions defined there. Schedules had to be set manually after every deploy, which was error-prone and not infrastructure-as-code.
+
+**Additional problem:** The two tools create deployments under different flow name identities. `uvx prefect-cloud deploy` uses the Python function name (e.g., `vol_table_flow`), while `prefect deploy` uses the `@flow(name=...)` decorator (e.g., `APEX Volatility Table`). This made them incompatible — couldn't switch from one to the other without hitting the 5-deployment limit.
+
+**Decision:** Delete all 5 existing deployments and recreate them with `prefect deploy --all`. This is Prefect's standard deployment pattern: `prefect.yaml` is the single source of truth for deployment config including schedules, and `prefect deploy` applies it.
+
+**Changes:**
+- Fixed `prefect.yaml`: aligned work pool name (`default-work-pool`), deployment names match function names, removed redundant push/requirements sections
+- Deployment command: `prefect deploy --all --no-prompt` (replaces `uvx prefect-cloud deploy`)
+- Manual run command: `prefect deployment run 'Flow Name/deployment_name'` (replaces `uvx prefect-cloud run`)
+
+**Revisit signal:** If `prefect deploy` breaks due to version mismatch (local CLI vs managed work pool), the fallback is `uvx prefect-cloud deploy` + manual schedule setting via the Prefect SDK.

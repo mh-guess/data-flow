@@ -76,7 +76,9 @@ prefect cloud login
 - **tiingo_fundamentals_flow.py**: Daily fundamentals pipeline (metrics, statements, definitions, meta)
 - **tiingo_fundamentals_backfill_flow.py**: Historical fundamentals backfill with rate limiting
 - **migrate_s3_eod_prefix.py**: One-time S3 migration script (run locally, not deployed)
-- **prefect.yaml**: Infrastructure as Code for deployments (4 deployments)
+- **vol_table_flow.py**: APEX daily volatility table pipeline
+- **test_vol_table.py**: Unit tests for volatility computation
+- **prefect.yaml**: Infrastructure as Code for deployments (5 deployments, schedules defined here)
 - **requirements.txt**: Python dependencies
 
 ### Documentation
@@ -86,24 +88,6 @@ prefect cloud login
 
 ## Common Operations
 
-### Run Flows Manually
-
-```bash
-# Daily flow (fetches last 30 days)
-uvx prefect-cloud run tiingo_to_s3_flow/tiingo_to_s3_flow
-
-# Backfill 2020-2024 for all tickers
-uvx prefect-cloud run tiingo_backfill_flow/tiingo_backfill_flow \
-  --parameter start_year=2020 \
-  --parameter end_year=2024
-
-# Backfill specific tickers
-uvx prefect-cloud run tiingo_backfill_flow/tiingo_backfill_flow \
-  --parameter start_year=2023 \
-  --parameter end_year=2024 \
-  --parameter tickers='["AAPL","TSLA"]'
-```
-
 ### Deploy Updates
 
 ```bash
@@ -112,26 +96,35 @@ git add .
 git commit -m "Your message"
 git push
 
-# Deploy daily pipeline
-uvx prefect-cloud deploy tiingo_to_s3_flow.py:tiingo_to_s3_flow \
-  --from mh-guess/data-flow \
-  --with-requirements requirements.txt
+# Deploy all pipelines (schedules applied from prefect.yaml)
+prefect deploy --all --no-prompt
 
-# Deploy backfill pipeline
-uvx prefect-cloud deploy tiingo_backfill_flow.py:tiingo_backfill_flow \
-  --from mh-guess/data-flow \
-  --with-requirements requirements.txt
+# Deploy a single pipeline
+prefect deploy -n vol_table_flow --no-prompt
+```
+
+**Important:** Do NOT use `uvx prefect-cloud deploy` — it ignores `prefect.yaml` and does not apply schedules.
+
+### Run Flows Manually
+
+```bash
+# EOD daily
+prefect deployment run 'Tiingo to S3 ETL/tiingo_to_s3_flow'
+
+# EOD backfill
+prefect deployment run 'Tiingo Historical Backfill/tiingo_backfill_flow' \
+  -p start_year=2020 -p end_year=2024
+
+# APEX volatility table
+prefect deployment run 'APEX Volatility Table/vol_table_flow'
 ```
 
 ### Manage Schedule
 
-```bash
-# View current schedule in Prefect Cloud UI or:
-# Change schedule (cron format: minute hour day month day-of-week)
-uvx prefect-cloud schedule tiingo_to_s3_flow/tiingo_to_s3_flow "0 18 * * 1-5"
+Schedules are defined in `prefect.yaml`. To change a schedule, edit the YAML and redeploy:
 
-# Remove schedule
-uvx prefect-cloud schedule tiingo_to_s3_flow/tiingo_to_s3_flow none
+```bash
+prefect deploy -n <deployment_name> --no-prompt
 ```
 
 ## Prefect Cloud Configuration

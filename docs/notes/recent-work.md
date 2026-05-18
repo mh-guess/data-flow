@@ -2,6 +2,18 @@
 
 *Last updated: 2026-05-11*
 
+## Session: 2026-05-17 (deployment migration)
+
+### Migrated to standard `prefect deploy` pattern
+- Discovered vol table schedule was missing — `uvx prefect-cloud deploy` was wiping schedules on every redeploy because it ignores `prefect.yaml`
+- Root cause: `uvx prefect-cloud deploy` and `prefect deploy` create deployments under different flow name identities (function name vs `@flow(name=...)` decorator)
+- Deleted all 5 deployments and recreated with `prefect deploy --all --no-prompt`
+- Schedules are now defined as code in `prefect.yaml` and applied automatically on deploy
+- Fixed `prefect.yaml`: corrected work pool name (`default-work-pool`), cleaned up redundant config
+- Updated operations runbook to use `prefect deploy` commands exclusively
+
+---
+
 ## Session: 2026-05-11 (APEX volatility table pipeline)
 
 ### New pipeline: `vol_table_flow.py`
