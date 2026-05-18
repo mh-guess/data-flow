@@ -1,217 +1,79 @@
 # Prefect Deployment Configuration
-# This file manages the Tiingo to S3 ETL deployment as Infrastructure as Code
+# Deploy all: prefect deploy --all --no-prompt
+# Deploy one: prefect deploy -n tiingo_to_s3_flow --no-prompt
 
-# Prefect version this file is compatible with
-prefect-version: 2.14.0
-
-# Deployment configurations
 deployments:
-  - name: tiingo-to-s3-production
+  - name: tiingo_to_s3_flow
     description: "ETL pipeline that fetches daily price data from Tiingo API and loads to S3"
-    version: 1.0.0
-    tags:
-      - etl
-      - tiingo
-      - s3
-      - production
-
-    # Flow entrypoint
     entrypoint: tiingo_to_s3_flow.py:tiingo_to_s3_flow
-
-    # Schedule: 6 PM on weekdays (Mon-Fri)
-    # Note: Adjust timezone in Prefect Cloud UI to America/Los_Angeles
     schedules:
       - cron: "0 18 * * 1-5"
         timezone: "America/Los_Angeles"
         active: true
-
-    # Work pool configuration (using Prefect Cloud managed execution)
     work_pool:
-      name: "default-agent-pool"
-
-    # Build step - no custom build needed
+      name: "default-work-pool"
     build: null
-
-    # Push step - code is in GitHub
-    push:
-      - prefect.deployments.steps.git_clone:
-          repository: https://github.com/mh-guess/data-flow.git
-          branch: main
-
-    # Pull step - pull from GitHub when running
     pull:
       - prefect.deployments.steps.git_clone:
           repository: https://github.com/mh-guess/data-flow.git
           branch: main
 
-    # Python dependencies
-    requirements:
-      - prefect>=2.14.0
-      - requests>=2.31.0
-      - boto3>=1.29.0
-      - prefect-aws>=0.4.0
-
-  - name: tiingo-backfill
+  - name: tiingo_backfill_flow
     description: "On-demand historical data backfill with year-level partitioning (load_type=retro)"
-    version: 1.0.0
-    tags:
-      - backfill
-      - tiingo
-      - s3
-      - historical
-      - retro
-
-    # Flow entrypoint
     entrypoint: tiingo_backfill_flow.py:tiingo_backfill_flow
-
-    # No schedule - this is on-demand only
     schedules: []
-
-    # Default parameters for backfill
     parameters:
       start_year: 2020
       end_year: 2024
-
-    # Work pool configuration (using Prefect Cloud managed execution)
     work_pool:
-      name: "default-agent-pool"
-
-    # Build step - no custom build needed
+      name: "default-work-pool"
     build: null
-
-    # Push step - code is in GitHub
-    push:
-      - prefect.deployments.steps.git_clone:
-          repository: https://github.com/mh-guess/data-flow.git
-          branch: main
-
-    # Pull step - pull from GitHub when running
     pull:
       - prefect.deployments.steps.git_clone:
           repository: https://github.com/mh-guess/data-flow.git
           branch: main
 
-    # Python dependencies
-    requirements:
-      - prefect>=2.14.0
-      - requests>=2.31.0
-      - boto3>=1.29.0
-      - prefect-aws>=0.4.0
-
-  - name: tiingo-fundamentals-daily
+  - name: tiingo_fundamentals_flow
     description: "Daily pipeline for Tiingo fundamentals (daily metrics, statements, definitions, meta)"
-    version: 1.0.0
-    tags:
-      - etl
-      - tiingo
-      - fundamentals
-      - s3
-      - production
-
     entrypoint: tiingo_fundamentals_flow.py:tiingo_fundamentals_flow
-
     schedules:
       - cron: "0 18 * * 1-5"
         timezone: "America/Los_Angeles"
         active: true
-
     work_pool:
-      name: "default-agent-pool"
-
+      name: "default-work-pool"
     build: null
-
-    push:
-      - prefect.deployments.steps.git_clone:
-          repository: https://github.com/mh-guess/data-flow.git
-          branch: main
-
     pull:
       - prefect.deployments.steps.git_clone:
           repository: https://github.com/mh-guess/data-flow.git
           branch: main
 
-    requirements:
-      - prefect>=2.14.0
-      - requests>=2.31.0
-      - boto3>=1.29.0
-      - prefect-aws>=0.4.0
-
-  - name: tiingo-fundamentals-backfill
+  - name: tiingo_fundamentals_backfill_flow
     description: "On-demand historical fundamentals backfill with year-level partitioning"
-    version: 1.0.0
-    tags:
-      - backfill
-      - tiingo
-      - fundamentals
-      - s3
-      - historical
-
     entrypoint: tiingo_fundamentals_backfill_flow.py:tiingo_fundamentals_backfill_flow
-
     schedules: []
-
     parameters:
       start_year: 2020
       end_year: 2024
-
     work_pool:
-      name: "default-agent-pool"
-
+      name: "default-work-pool"
     build: null
-
-    push:
-      - prefect.deployments.steps.git_clone:
-          repository: https://github.com/mh-guess/data-flow.git
-          branch: main
-
     pull:
       - prefect.deployments.steps.git_clone:
           repository: https://github.com/mh-guess/data-flow.git
           branch: main
 
-    requirements:
-      - prefect>=2.14.0
-      - requests>=2.31.0
-      - boto3>=1.29.0
-      - prefect-aws>=0.4.0
-
-  - name: apex-vol-table-daily
+  - name: vol_table_flow
     description: "Daily volatility table for APEX trading system (per-minute vol estimates)"
-    version: 1.0.0
-    tags:
-      - etl
-      - apex
-      - volatility
-      - s3
-      - production
-
     entrypoint: vol_table_flow.py:vol_table_flow
-
     schedules:
       - cron: "0 18 * * 1-5"
         timezone: "America/New_York"
         active: true
-
     work_pool:
-      name: "default-agent-pool"
-
+      name: "default-work-pool"
     build: null
-
-    push:
-      - prefect.deployments.steps.git_clone:
-          repository: https://github.com/mh-guess/data-flow.git
-          branch: main
-
     pull:
       - prefect.deployments.steps.git_clone:
           repository: https://github.com/mh-guess/data-flow.git
           branch: main
-
-    requirements:
-      - prefect>=2.14.0
-      - requests>=2.31.0
-      - boto3>=1.29.0
-      - prefect-aws>=0.4.0
-
-# Global configuration
-name: tiingo-data-pipeline
