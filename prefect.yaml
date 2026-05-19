@@ -2,6 +2,13 @@
 # Deploy all: prefect deploy --all --no-prompt
 # Deploy one: prefect deploy -n tiingo_to_s3_flow --no-prompt
 
+pull:
+  - prefect.deployments.steps.git_clone:
+      repository: https://github.com/mh-guess/data-flow.git
+      branch: main
+  - prefect.deployments.steps.run_shell_script:
+      script: pip install -r requirements.txt
+
 deployments:
   - name: tiingo_to_s3_flow
     description: "ETL pipeline that fetches daily price data from Tiingo API and loads to S3"
@@ -13,10 +20,6 @@ deployments:
     work_pool:
       name: "default-work-pool"
     build: null
-    pull:
-      - prefect.deployments.steps.git_clone:
-          repository: https://github.com/mh-guess/data-flow.git
-          branch: main
 
   - name: tiingo_backfill_flow
     description: "On-demand historical data backfill with year-level partitioning (load_type=retro)"
@@ -28,10 +31,6 @@ deployments:
     work_pool:
       name: "default-work-pool"
     build: null
-    pull:
-      - prefect.deployments.steps.git_clone:
-          repository: https://github.com/mh-guess/data-flow.git
-          branch: main
 
   - name: tiingo_fundamentals_flow
     description: "Daily pipeline for Tiingo fundamentals (daily metrics, statements, definitions, meta)"
@@ -43,10 +42,6 @@ deployments:
     work_pool:
       name: "default-work-pool"
     build: null
-    pull:
-      - prefect.deployments.steps.git_clone:
-          repository: https://github.com/mh-guess/data-flow.git
-          branch: main
 
   - name: tiingo_fundamentals_backfill_flow
     description: "On-demand historical fundamentals backfill with year-level partitioning"
@@ -58,10 +53,6 @@ deployments:
     work_pool:
       name: "default-work-pool"
     build: null
-    pull:
-      - prefect.deployments.steps.git_clone:
-          repository: https://github.com/mh-guess/data-flow.git
-          branch: main
 
   - name: vol_table_flow
     description: "Daily volatility table for APEX trading system (per-minute vol estimates)"
@@ -73,7 +64,3 @@ deployments:
     work_pool:
       name: "default-work-pool"
     build: null
-    pull:
-      - prefect.deployments.steps.git_clone:
-          repository: https://github.com/mh-guess/data-flow.git
-          branch: main
