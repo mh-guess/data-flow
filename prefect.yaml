@@ -4,9 +4,11 @@
 
 pull:
   - prefect.deployments.steps.git_clone:
+      id: clone-repo
       repository: https://github.com/mh-guess/data-flow.git
       branch: main
   - prefect.deployments.steps.run_shell_script:
+      directory: "{{ clone-repo.directory }}"
       script: pip install -r requirements.txt
 
 deployments:
