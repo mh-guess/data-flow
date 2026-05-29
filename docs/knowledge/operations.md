@@ -50,6 +50,10 @@ The schedule is applied automatically — no separate CLI command needed.
 
 **Vol table pipeline:** Edit `symbols.yaml` in the `mh-guess/apex` GitHub repo. The pipeline fetches it from GitHub at runtime — no changes needed in data-flow.
 
+## Alerting
+
+A Prefect Cloud automation **"Email on flow failure"** sends email to `timhuang.dev@gmail.com` whenever any flow run enters `Failed` or `Crashed` state. It is wired to the Email notification block `flow-failure-email`. To change the recipient, edit the block in the Prefect Cloud UI (Blocks → Email → `flow-failure-email`). To pause alerts (e.g. during a known-bad redeploy window), disable the automation in the UI rather than deleting it.
+
 ## Troubleshooting
 
 | Symptom | Check |
@@ -60,6 +64,8 @@ The schedule is applied automatically — no separate CLI command needed.
 | Empty ticker list | Check `s3://mh-guess-data/adhoc/tickers.txt` exists and has content |
 | API rate limits | Tiingo free tier allows 50 requests/hour; check Tiingo dashboard |
 | Vol table GitHub 404 | Check `github-pat-apex` Secret block has a valid PAT with `repo` scope |
+| `ModuleNotFoundError: No module named 'importlib_metadata'` (or any other missing stdlib-adjacent backport) | Managed work pool base image dropped a package that `prefect`/`prefect_aws` still imports. Pin it explicitly in `requirements.txt` and redeploy. See decision log 2026-05-28. |
+| Did not receive failure email | Check Prefect Cloud → Automations → "Email on flow failure" is enabled. Check the `flow-failure-email` block has the right recipient. Check spam for `notifications@prefect.io`. |
 
 ## Key Links
 

@@ -1,6 +1,19 @@
 # Recent Work
 
-*Last updated: 2026-05-11*
+*Last updated: 2026-05-28*
+
+## Session: 2026-05-28 (importlib_metadata fix + failure alerting)
+
+### Root-caused the silent crash loop
+All 3 scheduled daily flows had been crashing for ~5 days (2026-05-25 onward) with `ModuleNotFoundError: No module named 'importlib_metadata'`. Last successful run was 2026-05-22. The managed work pool base image dropped the `importlib_metadata` backport, but `prefect_aws.__init__` (triggered by `from prefect_aws import AwsCredentials` in `shared.py`) still imports it transitively via `prefect.workers.base`.
+
+### Fix
+Added `importlib_metadata>=8.0.0` to `requirements.txt`. Redeployed all 5 deployments with `prefect deploy --all --no-prompt`. Manually triggered all 3 scheduled flows — all completed successfully.
+
+### Failure alerting
+Created Prefect Cloud automation **"Email on flow failure"** (`b1f2f33f-4442-49f8-843a-c560f65bb699`) that fires on any `prefect.flow-run.Failed` / `prefect.flow-run.Crashed` event and emails `timhuang.dev@gmail.com` via Cloud email block `flow-failure-email` (`4764d99a-a8dc-4790-880e-96c4ee092712`). Both created programmatically via the Prefect SDK; documented in `docs/knowledge/operations.md` § Alerting and `docs/knowledge/decisions.md`.
+
+---
 
 ## Session: 2026-05-17 (deployment migration)
 

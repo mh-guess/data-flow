@@ -75,3 +75,35 @@
 - Manual run command: `prefect deployment run 'Flow Name/deployment_name'` (replaces `uvx prefect-cloud run`)
 
 **Revisit signal:** If `prefect deploy` breaks due to version mismatch (local CLI vs managed work pool), the fallback is `uvx prefect-cloud deploy` + manual schedule setting via the Prefect SDK.
+
+## 2026-05-28: Pin `importlib_metadata` in requirements.txt
+
+**Context:** All 3 scheduled flows started crashing 2026-05-25 with `ModuleNotFoundError: No module named 'importlib_metadata'`. The crash happened during flow load — `shared.py` does `from prefect_aws import AwsCredentials`, which triggers `prefect_aws/__init__.py` → `prefect.workers.base`, which does `from importlib_metadata import ...` (the backport package, not stdlib `importlib.metadata`). The managed work pool's base image stopped shipping the backport on or around 2026-05-25, so the import failed for every flow.
+
+The last successful runs were 2026-05-22; the next scheduled runs all crashed. Same `prefect[aws]==3.6.29` pin, no code change — purely a base image regression.
+
+**Decision:** Add `importlib_metadata>=8.0.0` to `requirements.txt` so the pull-step `pip install` always brings it in, regardless of what the base image ships.
+
+**Alternatives considered:**
+- *Replace `from prefect_aws import AwsCredentials` with `from prefect_aws.credentials import AwsCredentials`* — relies on Python's import system not eagerly running `prefect_aws/__init__.py`, which it does. Doesn't avoid the broken import path.
+- *Build a custom Docker image with everything pinned* — most robust but slowest to set up; deferred until the base image breaks us a third time.
+- *Upgrade to a newer Prefect version* — `3.7.0` is still broken (see prior decision), so this isn't a quick win.
+
+**Verification:** After redeploying with the pin, manually triggered all 3 scheduled flows (`Tiingo to S3 ETL`, `Tiingo Fundamentals Daily`, `APEX Volatility Table`) — all completed successfully.
+
+**Revisit signal:** Same as the prefect pin — every time the base image changes, something else may break similarly. Pattern: pin it in `requirements.txt`, redeploy, move on.
+
+## 2026-05-28: Alert on flow failure via Prefect Cloud automation
+
+**Context:** All 3 daily scheduled flows had been crashing for ~5 days before we noticed (silent failure). Without alerting, a broken pipeline can go unnoticed across multiple scheduled runs and we lose data freshness without realizing it.
+
+**Decision:** Create a single Prefect Cloud automation **"Email on flow failure"** that triggers on any `prefect.flow-run.Failed` or `prefect.flow-run.Crashed` event and emails `timhuang.dev@gmail.com` via the Cloud-hosted email notification block `flow-failure-email`.
+
+**Scope:** Covers *all* flow runs in the workspace (not just the 3 scheduled flows). Backfill flows are on-demand and could legitimately fail in ways the operator already knows about, but the cost of a few extra emails during a backfill is lower than the cost of building flow-specific scoping that we'd then have to maintain.
+
+**Alternatives considered:**
+- *Webhook → SES/SendGrid* — more control over sender identity, but adds infra we don't have.
+- *Slack/Discord* — faster delivery, but no chat tool standardized for this project yet.
+- *On-flow `on_crashed` / `on_failure` hooks in code* — only fires when the flow code itself runs, so misses the most common failure mode here (crash during import / pull step, before user code executes).
+
+**Verification:** Block + automation were created programmatically via the Prefect SDK and confirmed enabled. The next time a flow crashes naturally, the email will validate end-to-end delivery.
