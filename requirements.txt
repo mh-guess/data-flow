@@ -4,6 +4,12 @@
 # TODO: Remove pin once Prefect fixes the base image.
 prefect[aws]==3.6.29
 
+# prefect.workers.base imports `importlib_metadata` (the backport, not stdlib
+# importlib.metadata). The managed work pool base image stopped shipping it
+# around 2026-05-25 and all 3 daily flows crashed on import. Pin it here so
+# we don't depend on the base image including it.
+importlib_metadata>=8.0.0
+
 # Tiingo API integration
 requests>=2.31.0
 
