@@ -160,25 +160,35 @@ class TestBetaR2Parity:
         expected_r2 = np.corrcoef(j["ret_s"], j["ret_e"])[0, 1] ** 2
         assert abs(r2 - expected_r2) < 1e-10, f"r2={r2} vs expected={expected_r2}"
 
-    def test_no_lookahead(self):
-        """Returns ending exactly at as_of - 1 (no look-ahead)."""
-        etf_df = _make_price_df(n_days=80, seed=20)
+    def test_window_inclusive_of_as_of(self):
+        """Window is d <= as_of (inclusive): as_of day's bar is included."""
+        # Use exactly lookback+1 obs so every boundary difference shows in n_obs.
+        # _make_price_df(n_days=61) → _compute_returns drops 1 → 60 return rows.
+        lookback = 60
+        etf_df = _make_price_df(n_days=lookback + 1, seed=20)
         stock_df = _make_correlated_df(etf_df, beta=1.0, noise_std=0.001, seed=21)
 
         etf_ret = _compute_returns(etf_df)
         stock_ret = _compute_returns(stock_df)
 
-        # Set as_of to the date that IS in the data — it should be excluded.
-        last_date = etf_ret["d"].max()  # already date object
-        as_of = last_date  # as_of = last bar date; that date must be excluded
+        last_date = etf_ret["d"].max()  # already a date object
+        # With 60 return rows and lookback=60, all 60 are available.
 
-        _, _, n1 = beta_r2_pair(stock_ret, etf_ret, as_of)
+        # as_of = last_date: that date is INCLUDED (d <= as_of) → all 60 rows.
+        _, _, n_inclusive = beta_r2_pair(stock_ret, etf_ret, last_date, lookback=lookback)
 
-        as_of_next = last_date + timedelta(days=3)  # well beyond the data
-        _, _, n2 = beta_r2_pair(stock_ret, etf_ret, as_of_next)
+        # as_of = last_date - 1 trading day: last_date is EXCLUDED → only 59 rows.
+        prev_date = last_date - timedelta(days=1)
+        # prev_date might be a weekend; go back far enough to hit a weekday.
+        while prev_date.weekday() >= 5:
+            prev_date -= timedelta(days=1)
+        _, _, n_exclusive = beta_r2_pair(stock_ret, etf_ret, prev_date, lookback=lookback)
 
-        # With as_of = last date, the last date's return is excluded → fewer obs.
-        assert n1 <= n2, f"as_of day must be excluded: n1={n1}, n2={n2}"
+        assert n_inclusive > n_exclusive, (
+            f"as_of={last_date} (inclusive) should have more obs than "
+            f"as_of={prev_date} (one day earlier): "
+            f"n_inclusive={n_inclusive}, n_exclusive={n_exclusive}"
+        )
 
     def test_insufficient_data_returns_nan(self):
         """With fewer than 30 overlapping obs, returns (nan, nan, n)."""
@@ -206,18 +216,26 @@ class TestBetaR2Parity:
         assert n_obs <= 60
 
     def test_matches_lib_py_formula(self):
-        """Cross-check against an independent reimplementation of lib.py::beta_r2."""
+        """
+        Cross-check against an independent reimplementation of the OLS formula.
+
+        Convention: beta_r2_pair window is d <= as_of (inclusive). lib.py::beta_r2
+        uses as_of_date as the event/pick date with window ending at as_of_date - 1.
+        To reproduce lib.py results, callers set as_of = prior_trading_day(pick_date).
+        Here we verify the core math by passing as_of = last bar date and checking
+        against an inline reimplementation with the same d <= as_of boundary.
+        """
         etf_df = _make_price_df(n_days=100, seed=50)
         stock_df = _make_correlated_df(etf_df, beta=1.2, noise_std=0.003, seed=51)
 
         etf_ret = _compute_returns(etf_df)
         stock_ret = _compute_returns(stock_df)
-        as_of = etf_ret["d"].max() + timedelta(days=1)
+        as_of = etf_ret["d"].max()  # use last bar date — it is included (d <= as_of)
 
         beta_got, r2_got, n_got = beta_r2_pair(stock_ret, etf_ret, as_of)
 
-        # Replicate lib.py formula independently.
-        end = (pd.Timestamp(as_of) - pd.Timedelta(days=1)).date()
+        # Inline reimplementation using the same d <= as_of inclusive boundary.
+        end = pd.Timestamp(as_of).date()
         s = stock_ret[stock_ret["d"] <= end].tail(60)
         e = etf_ret[etf_ret["d"] <= end].tail(60)
         j = pd.merge(s[["d", "ret"]], e[["d", "ret"]], on="d", suffixes=("_s", "_e")).dropna()

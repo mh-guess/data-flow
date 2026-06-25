@@ -38,6 +38,7 @@ from hedge_map_flow import (
     ALPACA_BATCH_SIZE,
     ALPACA_RATE_DELAY,
     MIN_N_OBS,
+    _prior_trading_day,
 )
 
 HERE = os.path.dirname(__file__)
@@ -134,15 +135,19 @@ def main():
     results = []
     for _, ev in events.iterrows():
         stock = ev["data_symbol"]
-        as_of = ev["date"]
+        pick_date = ev["date"]
         research_etf = ev["best_etf"]
         research_beta = ev["best_beta"]
         research_r2 = ev["best_r2"]
 
+        # beta_r2_pair now uses d <= as_of (inclusive), so pass prior_trading_day(pick_date)
+        # to reproduce the research window that ends at pick_date - 1 trading day.
+        as_of = _prior_trading_day(pick_date)
+
         stock_bars = all_bars.get(stock, pd.DataFrame())
         if stock_bars.empty:
             results.append({
-                "stock": stock, "date": as_of, "research_etf": research_etf,
+                "stock": stock, "date": pick_date, "research_etf": research_etf,
                 "classification": "SKIP_NO_STOCK_BARS", "note": "no bars",
             })
             continue
@@ -166,7 +171,7 @@ def main():
 
         if not cands:
             results.append({
-                "stock": stock, "date": as_of, "research_etf": research_etf,
+                "stock": stock, "date": pick_date, "research_etf": research_etf,
                 "classification": "SKIP_NO_ETF_CANDS", "note": "no ETF bars",
             })
             continue
@@ -217,7 +222,7 @@ def main():
 
         results.append({
             "stock": stock,
-            "date": str(as_of),
+            "date": str(pick_date),  # report the original pick date, not the shifted as_of
             "research_etf": research_etf,
             "research_beta": research_beta,
             "research_r2": research_r2,

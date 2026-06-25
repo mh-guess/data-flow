@@ -405,16 +405,19 @@ def beta_r2_pair(
     """
     OLS beta + R² of stock daily returns on ETF daily returns.
 
-    Matches lib.py::beta_r2 exactly:
-      - window ends day BEFORE as_of (no look-ahead)
-      - tail(lookback) after date filter
-      - cov/var(ddof=1) formulation
+    Window: trailing `lookback` trading days with `d <= as_of` (inclusive).
+    `as_of` is the last close date to include, i.e. the close whose bars are
+    already available when this function is called.
+
+    Callers set `as_of` to the last completed close, making `as_of_date` in
+    the output parquet an accurate label for "close through which betas were
+    computed." This differs from lib.py::beta_r2 which takes `as_of_date` as
+    the event/pick date and ends the window at `as_of_date - 1`; the parity
+    harness compensates by passing `prior_trading_day(pick_date)` as `as_of`.
 
     Returns (beta, r2, n_obs). Returns (nan, nan, n) if n < MIN_N_OBS or zero variance.
-    Note: lib.py uses n < 30 as its threshold but we enforce MIN_N_OBS=60 here so that
-    the function is self-contained — no caller should accept betas from short windows.
     """
-    end = (pd.Timestamp(as_of) - pd.Timedelta(days=1)).date()
+    end = pd.Timestamp(as_of).date()  # inclusive: window uses d <= as_of
     s = stock_ret[stock_ret["d"] <= end].tail(lookback)
     e = etf_ret[etf_ret["d"] <= end].tail(lookback)
     j = pd.merge(s[["d", "ret"]], e[["d", "ret"]], on="d", suffixes=("_s", "_e")).dropna()
@@ -428,8 +431,8 @@ def beta_r2_pair(
 
 
 def compute_adv(df: pd.DataFrame, as_of: date, n_days: int = ADV_LOOKBACK_DAYS) -> float:
-    """Trailing-N-day $ADV ending the day before as_of. Matches select_hedges.py::adv_usd."""
-    end = (pd.Timestamp(as_of) - pd.Timedelta(days=1)).date()
+    """Trailing-N-day $ADV with `d <= as_of` (inclusive). `as_of` is the last close to include."""
+    end = pd.Timestamp(as_of).date()  # inclusive
     w = df[df["d"] <= end].tail(n_days)
     return float(w["dollar_vol"].mean()) if len(w) else np.nan
 
@@ -728,12 +731,12 @@ def hedge_map_flow(
             etf_meta[etf] = {"shortable": False, "easy_to_borrow": False}
 
     # --- Bars ---
-    # Fetch 60 trading days + 30 ADV window + buffer ending the day BEFORE the most recent
-    # as_of (defensive: never include as_of day's bar in the fetched window).
+    # Fetch bars through as_of_dates[0] (inclusive): as_of_date is the last close used
+    # in beta/ADV computation, so that close's bar must be present.
     # 60 trading days ≈ 87 calendar days; ADV window adds ~43 more; 130d total provides
     # headroom for holiday-heavy periods (Dec, Nov) without being wasteful.
     earliest_as_of = as_of_dates[-1]  # oldest date in backfill
-    bar_end = as_of_dates[0] - timedelta(days=1)  # exclude as_of day's bar (no look-ahead)
+    bar_end = as_of_dates[0]           # inclusive: include the as_of close
     bar_start = earliest_as_of - timedelta(days=130)  # ~130 calendar days of buffer
 
     all_symbols = list(universe["symbol"].tolist()) + ETF_CANDIDATES

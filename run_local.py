@@ -188,9 +188,9 @@ def run(
     # ETF metadata.
     etf_meta = build_etf_meta_local(universe)
 
-    # Bars.
+    # Bars: fetch through as_of_dates[0] inclusive — as_of is the last close used in betas.
     earliest_as_of = as_of_dates[-1]
-    bar_end = as_of_dates[0] - timedelta(days=1)  # exclude as_of day (defensive)
+    bar_end = as_of_dates[0]  # inclusive: as_of close is the last bar needed
     bar_start = earliest_as_of - timedelta(days=130)
 
     all_symbols = list(dict.fromkeys(universe["symbol"].tolist() + ETF_CANDIDATES))

@@ -133,10 +133,17 @@ The spec requires at least 60 overlapping daily return observations for a valid 
 
 ETFs found in the `us_equity` active universe are read from there. ETFs absent from that classification (rare) are fetched individually from the asset endpoint. This avoids silently defaulting any candidate ETF to non-shortable.
 
-### 7. Bar fetch window
+### 7. Bar fetch window and beta window convention
 
-`bar_end = as_of - 1d` (defensive: never fetch the as_of day itself).
+`bar_end = as_of_dates[0]` (inclusive: the as_of close is the last close used in betas and ADV).
 `bar_start = earliest_as_of - 130 calendar days` (covers 60 trading days + 30 ADV days + buffer for holiday-heavy periods).
+
+`beta_r2_pair` and `compute_adv` use `d <= as_of` (inclusive). This means:
+- `as_of_date` in the output parquet exactly means "the last close used in beta/ADV computation" — schema-accurate.
+- The scheduled 18:30 ET run uses today's close, which is settled by then. No one-day staleness.
+- `effective_date = next_trading_day(as_of_date)` holds as the schema invariant.
+
+**Parity convention**: `lib.py::beta_r2` takes `as_of_date = pick_date` (the event/announcement date) and ends its window at `pick_date - 1`. The parity harness compensates by passing `as_of = prior_trading_day(pick_date)` to `beta_r2_pair`, so the beta window ends at `pick_date - 1` inclusive — reproducing research results. Parity gate: 0 unexpected divergences (same bars, same picks).
 
 ### 8. SYMBOL_REMAP
 
