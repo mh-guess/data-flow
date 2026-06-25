@@ -7,6 +7,8 @@ Tests:
   3. Liquid + shortable selection screen
   4. Schema conformance
   5. Offline dry-run on synthetic fixture (no network)
+  6. P1-a: Alpaca credential loading (_init_alpaca_creds)
+  7. P1-b: Scheduled as_of default produces the right effective_date
 """
 
 from __future__ import annotations
@@ -22,6 +24,8 @@ import pytest
 # Allow import from the worktree root.
 sys.path.insert(0, os.path.dirname(__file__))
 
+import unittest.mock as mock
+
 from hedge_map_flow import (
     ETF_CANDIDATES,
     MIN_N_OBS,
@@ -32,8 +36,14 @@ from hedge_map_flow import (
     compute_hedge_map,
     _compute_returns,
     _next_trading_day,
+    _latest_trading_day,
+    _prior_trading_day,
+    _init_alpaca_creds,
     SYMBOL_REMAP,
+    ALPACA_KEY_BLOCK,
+    ALPACA_SECRET_BLOCK,
 )
+import hedge_map_flow as _flow_module
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +581,191 @@ class TestHelpers:
         r = _compute_returns(df)
         assert abs(r.iloc[0]["ret"] - 0.02) < 1e-10
         assert abs(r.iloc[1]["ret"] - (-0.02)) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# 6. P1-a: Alpaca credential loading
+# ---------------------------------------------------------------------------
+
+class TestAlpacraCreds:
+    """Verify _init_alpaca_creds loads from blocks with env-var fallback (P1-a)."""
+
+    def setup_method(self):
+        """Save and clear module-level credentials before each test."""
+        self._orig_key = _flow_module._alpaca_key
+        self._orig_secret = _flow_module._alpaca_secret
+        _flow_module._alpaca_key = ""
+        _flow_module._alpaca_secret = ""
+
+    def teardown_method(self):
+        """Restore original credentials after each test."""
+        _flow_module._alpaca_key = self._orig_key
+        _flow_module._alpaca_secret = self._orig_secret
+
+    def test_env_var_fallback_loads_creds(self, monkeypatch):
+        """With from_prefect_blocks=False, credentials are read from env vars."""
+        monkeypatch.setenv("ALPACA_API_KEY", "test-key-from-env")
+        monkeypatch.setenv("ALPACA_API_SECRET", "test-secret-from-env")
+
+        _init_alpaca_creds(from_prefect_blocks=False)
+
+        assert _flow_module._alpaca_key == "test-key-from-env"
+        assert _flow_module._alpaca_secret == "test-secret-from-env"
+
+    def test_headers_populated_after_init(self, monkeypatch):
+        """_alpaca_headers() returns correct dict after _init_alpaca_creds()."""
+        monkeypatch.setenv("ALPACA_API_KEY", "K123")
+        monkeypatch.setenv("ALPACA_API_SECRET", "S456")
+        _init_alpaca_creds(from_prefect_blocks=False)
+
+        from hedge_map_flow import _alpaca_headers
+        h = _alpaca_headers()
+        assert h["APCA-API-KEY-ID"] == "K123"
+        assert h["APCA-API-SECRET-KEY"] == "S456"
+
+    def test_headers_raises_before_init(self):
+        """_alpaca_headers() must raise RuntimeError if creds are empty."""
+        # Creds were cleared in setup_method.
+        from hedge_map_flow import _alpaca_headers
+        with pytest.raises(RuntimeError, match="_init_alpaca_creds"):
+            _alpaca_headers()
+
+    def test_missing_env_var_raises(self, monkeypatch):
+        """Missing ALPACA_API_KEY env var raises KeyError (not silent failure)."""
+        monkeypatch.delenv("ALPACA_API_KEY", raising=False)
+        monkeypatch.delenv("ALPACA_API_SECRET", raising=False)
+        with pytest.raises(KeyError):
+            _init_alpaca_creds(from_prefect_blocks=False)
+
+    def test_prefect_block_path_falls_back_to_env_on_block_failure(self, monkeypatch):
+        """If Secret.load() fails (no Prefect server), falls back to env vars."""
+        monkeypatch.setenv("ALPACA_API_KEY", "fallback-key")
+        monkeypatch.setenv("ALPACA_API_SECRET", "fallback-secret")
+
+        # Simulate Secret.load() raising (Prefect blocks unavailable).
+        with mock.patch("hedge_map_flow.Secret") as mock_secret:
+            mock_secret.load.side_effect = Exception("block not found")
+            _init_alpaca_creds(from_prefect_blocks=True)
+
+        assert _flow_module._alpaca_key == "fallback-key"
+        assert _flow_module._alpaca_secret == "fallback-secret"
+
+    def test_prefect_block_path_loads_from_blocks(self, monkeypatch):
+        """When Secret.load() succeeds, creds come from blocks (not env vars)."""
+        # Set env vars to different values so we can confirm blocks won the race.
+        monkeypatch.setenv("ALPACA_API_KEY", "env-key-should-not-be-used")
+        monkeypatch.setenv("ALPACA_API_SECRET", "env-secret-should-not-be-used")
+
+        mock_key_block = mock.MagicMock()
+        mock_key_block.get.return_value = "block-key"
+        mock_secret_block = mock.MagicMock()
+        mock_secret_block.get.return_value = "block-secret"
+
+        def _fake_load(name):
+            if name == ALPACA_KEY_BLOCK:
+                return mock_key_block
+            if name == ALPACA_SECRET_BLOCK:
+                return mock_secret_block
+            raise ValueError(f"unknown block: {name}")
+
+        with mock.patch("hedge_map_flow.Secret") as mock_secret:
+            mock_secret.load.side_effect = _fake_load
+            _init_alpaca_creds(from_prefect_blocks=True)
+
+        assert _flow_module._alpaca_key == "block-key"
+        assert _flow_module._alpaca_secret == "block-secret"
+
+
+# ---------------------------------------------------------------------------
+# 7. P1-b: Scheduled as_of default → correct effective_date
+# ---------------------------------------------------------------------------
+
+class TestScheduledDefault:
+    """
+    Verify that _latest_trading_day() and _prior_trading_day() produce the right
+    effective_date for the scheduled flow use-case (P1-b).
+    """
+
+    def test_latest_trading_day_weekday_returns_same_day(self):
+        """On a weekday, _latest_trading_day returns that day."""
+        tuesday = date(2026, 6, 23)
+        assert tuesday.weekday() == 1  # Tuesday
+        assert _latest_trading_day(tuesday) == tuesday
+
+    def test_latest_trading_day_saturday_returns_friday(self):
+        """On Saturday, _latest_trading_day returns the previous Friday."""
+        saturday = date(2026, 6, 20)
+        assert saturday.weekday() == 5
+        assert _latest_trading_day(saturday) == date(2026, 6, 19)  # Friday
+
+    def test_latest_trading_day_sunday_returns_friday(self):
+        """On Sunday, _latest_trading_day returns the previous Friday."""
+        sunday = date(2026, 6, 21)
+        assert sunday.weekday() == 6
+        assert _latest_trading_day(sunday) == date(2026, 6, 19)  # Friday
+
+    def test_scheduled_run_tuesday_produces_wednesday_effective(self):
+        """
+        A scheduled run on Tuesday evening (18:30 ET) sets as_of=Tuesday,
+        effective_date=Wednesday — the upcoming session.
+        """
+        tuesday = date(2026, 6, 23)  # weekday
+        as_of = _latest_trading_day(tuesday)
+        effective = _next_trading_day(as_of)
+        assert as_of == tuesday, "as_of should be today (Tuesday)"
+        assert effective == date(2026, 6, 24), "effective_date should be tomorrow (Wednesday)"
+
+    def test_scheduled_run_friday_produces_monday_effective(self):
+        """
+        A scheduled run on Friday evening sets as_of=Friday, effective_date=Monday.
+        """
+        friday = date(2026, 6, 19)  # 2026-06-19 is a Friday
+        assert friday.weekday() == 4  # sanity-check
+        as_of = _latest_trading_day(friday)
+        effective = _next_trading_day(as_of)
+        assert as_of == friday
+        assert effective == date(2026, 6, 22)  # following Monday (no holiday)
+
+    def test_prior_trading_day_is_strictly_before(self):
+        """_prior_trading_day returns a day strictly before the input."""
+        tuesday = date(2026, 6, 23)
+        result = _prior_trading_day(tuesday)
+        assert result < tuesday, "prior trading day must be strictly before input"
+        assert result == date(2026, 6, 22)  # Monday
+
+    def test_prior_vs_latest_differ_on_weekday(self):
+        """On a weekday, _latest returns today; _prior returns yesterday (or earlier)."""
+        wednesday = date(2026, 6, 24)
+        assert _latest_trading_day(wednesday) == wednesday
+        assert _prior_trading_day(wednesday) == date(2026, 6, 23)
+
+    def test_prior_vs_latest_converge_on_monday(self):
+        """
+        On a Monday, _latest returns Monday; _prior skips weekend and returns Friday.
+        """
+        monday = date(2026, 6, 23)
+        assert monday.weekday() == 1  # actually Tuesday 2026-06-23 is Tuesday; use real Monday
+        monday_real = date(2026, 6, 22)
+        assert monday_real.weekday() == 0  # Monday
+        assert _latest_trading_day(monday_real) == monday_real
+        assert _prior_trading_day(monday_real) == date(2026, 6, 19)  # Friday
+
+    def test_old_default_would_produce_stale_effective_date(self):
+        """
+        Regression test: the OLD default (_prior_trading_day) on a weekday produces
+        effective_date = today (already past for an evening run), not next session.
+        The NEW default (_latest_trading_day) produces effective_date = tomorrow.
+        """
+        today = date(2026, 6, 24)  # Wednesday
+        old_as_of = _prior_trading_day(today)   # Tuesday 2026-06-23
+        new_as_of = _latest_trading_day(today)  # Wednesday 2026-06-24
+
+        old_effective = _next_trading_day(old_as_of)  # Wednesday 2026-06-24 = today (STALE)
+        new_effective = _next_trading_day(new_as_of)  # Thursday 2026-06-25 = tomorrow (CORRECT)
+
+        assert old_effective == today, "old logic produces stale effective_date = today"
+        assert new_effective == today + timedelta(days=1), "new logic produces effective_date = tomorrow"
+        assert new_effective > old_effective, "new logic always produces a later effective_date"
 
 
 if __name__ == "__main__":

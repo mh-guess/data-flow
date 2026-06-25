@@ -68,7 +68,16 @@ SYMBOL_REMAP: dict[str, str] = {
 }
 
 ALPACA_BASE = "https://data.alpaca.markets/v2/stocks"
-ALPACA_BROKER_BASE = "https://paper-api.alpaca.markets/v2"  # asset metadata only
+
+# Alpaca Prefect Secret block names (set in Prefect Cloud; env vars used as fallback
+# for local runs via run_local.py which never calls Secret.load()).
+ALPACA_KEY_BLOCK = "alpaca-api-key"
+ALPACA_SECRET_BLOCK = "alpaca-api-secret"
+
+# Module-level credential storage populated by _init_alpaca_creds() at flow start.
+# Never print or log these values.
+_alpaca_key: str = ""
+_alpaca_secret: str = ""
 
 # Selection / eligibility parameters.
 MIN_LISTING_DAYS = 90       # stock must be listed ≥ 90 calendar days before as_of
@@ -86,13 +95,56 @@ ALPACA_RETRY_DELAYS = [10, 30, 60]  # 429/5xx back-off seconds
 
 
 # ---------------------------------------------------------------------------
+# Credential management
+# ---------------------------------------------------------------------------
+
+def _init_alpaca_creds(from_prefect_blocks: bool = True) -> None:
+    """
+    Populate module-level Alpaca credentials.
+
+    In deployed Prefect flows (`from_prefect_blocks=True`): loads from
+    `Secret.load(ALPACA_KEY_BLOCK)` / `Secret.load(ALPACA_SECRET_BLOCK)`.
+
+    Fallback (or when `from_prefect_blocks=False`): reads from environment variables
+    `ALPACA_API_KEY` / `ALPACA_API_SECRET` — used by run_local.py and CI.
+
+    Call exactly once at flow start before any Alpaca request is made.
+    Never log or print the values.
+    """
+    global _alpaca_key, _alpaca_secret
+
+    if from_prefect_blocks:
+        try:
+            _alpaca_key = Secret.load(ALPACA_KEY_BLOCK).get()
+            _alpaca_secret = Secret.load(ALPACA_SECRET_BLOCK).get()
+            return
+        except Exception as exc:
+            # Block not found or Prefect Cloud unavailable — fall through to env vars.
+            # This makes local development (prefect server or no server) work without
+            # requiring block setup.
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Alpaca Prefect blocks unavailable ({exc}); falling back to env vars."
+            )
+
+    _alpaca_key = os.environ["ALPACA_API_KEY"]
+    _alpaca_secret = os.environ["ALPACA_API_SECRET"]
+
+
+# ---------------------------------------------------------------------------
 # Low-level Alpaca helpers
 # ---------------------------------------------------------------------------
 
 def _alpaca_headers() -> dict[str, str]:
+    """Return Alpaca auth headers. Requires _init_alpaca_creds() to have been called."""
+    if not _alpaca_key or not _alpaca_secret:
+        raise RuntimeError(
+            "_alpaca_headers() called before _init_alpaca_creds(). "
+            "Call _init_alpaca_creds() at flow start."
+        )
     return {
-        "APCA-API-KEY-ID": os.environ["ALPACA_API_KEY"],
-        "APCA-API-SECRET-KEY": os.environ["ALPACA_API_SECRET"],
+        "APCA-API-KEY-ID": _alpaca_key,
+        "APCA-API-SECRET-KEY": _alpaca_secret,
     }
 
 
@@ -607,6 +659,11 @@ def hedge_map_flow(
     logger.info("=" * 60)
 
     # --- Credentials ---
+    # Load Alpaca creds from Prefect Secret blocks (deployed path) with env-var fallback.
+    # Must happen before any call to _alpaca_headers().
+    logger.info("Loading Alpaca credentials (Prefect Secret blocks with env-var fallback)...")
+    _init_alpaca_creds(from_prefect_blocks=True)
+
     logger.info("Loading AWS credentials from Prefect Cloud...")
     aws_credentials = AwsCredentials.load("aws-credentials-tim")
 
@@ -614,7 +671,11 @@ def hedge_map_flow(
     if as_of_override:
         as_of = date.fromisoformat(as_of_override)
     else:
-        as_of = _prior_trading_day(date.today())
+        # For a scheduled run at 18:30 ET (after today's close), as_of = today so that
+        # effective_date = next_trading_day(today) = the upcoming session.
+        # Using _latest_trading_day() instead of _prior_trading_day() ensures the run
+        # produces a partition the NEXT session can read, not one for today (already past).
+        as_of = _latest_trading_day(date.today())
     logger.info(f"as_of_date: {as_of}  |  effective_date: {_next_trading_day(as_of)}")
 
     # Build list of as_of dates (single run or backfill).
@@ -736,8 +797,27 @@ def hedge_map_flow(
 # Date helpers
 # ---------------------------------------------------------------------------
 
+def _latest_trading_day(d: date) -> date:
+    """
+    Return `d` itself if it is Mon–Fri (a trading weekday), otherwise the most recent
+    weekday before `d`.
+
+    Use for the scheduled-run default: a run at 18:30 ET on trading day X should set
+    as_of = X so that effective_date = next_trading_day(X) = the upcoming session.
+    """
+    candidate = d
+    while candidate.weekday() >= 5:  # 5=Sat, 6=Sun
+        candidate -= timedelta(days=1)
+    return candidate
+
+
 def _prior_trading_day(d: date) -> date:
-    """Return the most recent Mon–Fri before today (same day if it's Mon–Fri and market is closed)."""
+    """
+    Return the most recent Mon–Fri strictly before `d`.
+
+    Kept for backfill helpers and tests; the scheduled-run default uses
+    _latest_trading_day() instead.
+    """
     candidate = d - timedelta(days=1)
     while candidate.weekday() >= 5:
         candidate -= timedelta(days=1)

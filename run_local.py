@@ -39,6 +39,7 @@ from hedge_map_flow import (
     MIN_LISTING_DAYS,
     MIN_N_OBS,
     ADV_MIN_USD,
+    _init_alpaca_creds,
     _alpaca_headers,
     _get,
     _fetch_multi_bars_page,
@@ -49,6 +50,7 @@ from hedge_map_flow import (
     compute_eligibility,
     compute_hedge_map,
     _next_trading_day,
+    _latest_trading_day,
     _prior_trading_day,
     _trading_days_before,
 )
@@ -156,10 +158,13 @@ def run(
     print("Hedge Map ETL — local run")
     print("=" * 60)
 
+    # Initialize Alpaca creds from env vars (no Prefect blocks in local runner).
+    _init_alpaca_creds(from_prefect_blocks=False)
+
     s3 = boto3.client("s3", region_name="us-east-1")
 
-    # Dates.
-    as_of = date.fromisoformat(as_of_override) if as_of_override else _prior_trading_day(date.today())
+    # Dates: use _latest_trading_day() (same logic as the deployed flow default).
+    as_of = date.fromisoformat(as_of_override) if as_of_override else _latest_trading_day(date.today())
     as_of_dates = _trading_days_before(as_of, backfill_days) if backfill_days > 0 else [as_of]
     print(f"as_of_date: {as_of}  effective_date: {_next_trading_day(as_of)}")
     if backfill_days > 0:

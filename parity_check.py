@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from hedge_map_flow import (
     ETF_CANDIDATES,
     SYMBOL_REMAP,
+    _init_alpaca_creds,
     _alpaca_headers,
     _fetch_multi_bars_page,
     _bars_to_df,
@@ -42,6 +43,9 @@ from hedge_map_flow import (
 HERE = os.path.dirname(__file__)
 RESEARCH_DIR = "/Users/timhuang/projects/algo-trade/research/motley_fool/etf_hedge"
 HEDGE_RESOLVED = os.path.join(RESEARCH_DIR, "hedge_resolved.csv")
+
+# Initialize Alpaca credentials from env vars (parity_check.py runs locally, not via Prefect).
+_init_alpaca_creds(from_prefect_blocks=False)
 
 BETA_TOL = 0.05    # tolerance for beta comparison (absolute)
 R2_TOL = 0.02     # tolerance for r2 comparison (absolute)

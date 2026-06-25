@@ -149,7 +149,13 @@ S3 `put_object` overwrites. Re-running for the same `as_of` date replaces the pa
 ### 10. Prefect Cloud session expired at build time
 
 Prefect Cloud auth was unavailable during development (expired API key in `~/.prefect/profiles.toml`).
-The `run_local.py` script was used for the green run — it exercises the exact same computation code from `hedge_map_flow.py` but uses boto3 directly and `os.environ` for Alpaca credentials. For scheduled production runs, the flow uses `AwsCredentials.load("aws-credentials-tim")` and `Secret.load("alpaca-api-key")` / `Secret.load("alpaca-api-secret")` blocks. **Before deploying to Prefect Cloud, seed the Alpaca blocks** (see Run Instructions below).
+The `run_local.py` script was used for the green run — it exercises the exact same computation code from `hedge_map_flow.py` but uses boto3 directly and calls `_init_alpaca_creds(from_prefect_blocks=False)` to read `ALPACA_API_KEY` / `ALPACA_API_SECRET` from env vars.
+
+For scheduled production runs (Prefect Cloud deployed path), the flow calls `_init_alpaca_creds(from_prefect_blocks=True)` at startup — which loads from `Secret.load("alpaca-api-key")` / `Secret.load("alpaca-api-secret")` Prefect blocks, with env-var fallback if blocks are unavailable. **Before deploying to Prefect Cloud, seed the Alpaca blocks** (see Run Instructions below).
+
+### 11. Scheduled default as_of (P1-b)
+
+The scheduled cron runs at 18:30 ET (after market close) on Mon–Fri. The correct `as_of` for that run is **today** (today's close is complete), yielding `effective_date = next_trading_day(today)` = the upcoming session. The flow uses `_latest_trading_day(date.today())` which returns `today` when today is a weekday, else the most recent weekday. The old `_prior_trading_day(date.today())` returned yesterday, making `effective_date = today` (already expired).
 
 ---
 
@@ -183,12 +189,13 @@ prefect deployment run 'Hedge Map ETL/hedge_map_flow' \
 ```
 
 Note: The deployed flow loads credentials via `AwsCredentials.load("aws-credentials-tim")`.
-Alpaca credentials are read from env vars (`ALPACA_API_KEY`, `ALPACA_API_SECRET`) — these must be
-present in the worker environment, OR the flow can be modified to `Secret.load()` them from Prefect blocks.
+Alpaca credentials are loaded from Prefect Secret blocks (`alpaca-api-key`, `alpaca-api-secret`) with
+env-var fallback (`ALPACA_API_KEY` / `ALPACA_API_SECRET`) — the deployed worker does NOT need env vars
+if the blocks are seeded.
 
 ### Tests
 ```bash
-pytest test_hedge_map.py -v  # 27 tests, all offline
+pytest test_hedge_map.py -v  # 42 tests, all offline
 ```
 
 ---
