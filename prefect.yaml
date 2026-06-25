@@ -66,3 +66,15 @@ deployments:
     work_pool:
       name: "default-work-pool"
     build: null
+
+  - name: hedge_map_flow
+    description: "Nightly hedge-map ETL: top-3 beta-weighted hedge ETFs per eligible US equity (Part A, MF Drift Hedge Overlay)"
+    entrypoint: hedge_map_flow.py:hedge_map_flow
+    schedules:
+      - cron: "30 18 * * 1-5"
+        timezone: "America/New_York"
+        active: true
+    parameters: {}
+    work_pool:
+      name: "default-work-pool"
+    build: null
