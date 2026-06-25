@@ -162,16 +162,22 @@ def run(
     # Initialize Alpaca creds from env vars (no Prefect blocks in local runner).
     _init_alpaca_creds(from_prefect_blocks=False)
 
-    # Load exchange calendar so holiday-aware helpers work correctly.
-    cal_start = date.today() - timedelta(days=200)
-    cal_end = date.today() + timedelta(days=7)
+    # Determine raw as_of before loading the calendar so we cover the right window.
+    raw_as_of = date.fromisoformat(as_of_override) if as_of_override else date.today()
+
+    # Load exchange calendar over the actual requested window (not hardcoded today ± window).
+    # This ensures historical backfills get correct holiday-aware sessions.
+    cal_start = raw_as_of - timedelta(days=200)
+    cal_end = raw_as_of + timedelta(days=7)
     print(f"  Loading NYSE calendar {cal_start} → {cal_end}...")
     _init_trading_calendar(cal_start, cal_end)
 
     s3 = boto3.client("s3", region_name="us-east-1")
 
-    # Dates: use _latest_trading_day() (same logic as the deployed flow default).
-    as_of = date.fromisoformat(as_of_override) if as_of_override else _latest_trading_day(date.today())
+    # Snap as_of to the latest trading session with full holiday awareness.
+    as_of = _latest_trading_day(raw_as_of)
+    if as_of_override and as_of != raw_as_of:
+        print(f"  WARNING: {raw_as_of} is not a trading session; snapped to {as_of}.")
     as_of_dates = _trading_days_before(as_of, backfill_days) if backfill_days > 0 else [as_of]
     print(f"as_of_date: {as_of}  effective_date: {_next_trading_day(as_of)}")
     if backfill_days > 0:

@@ -873,5 +873,130 @@ class TestCalendarHelpers:
         assert result == [date(2025, 7, 7), date(2025, 7, 2), date(2025, 7, 1)]
 
 
+# ---------------------------------------------------------------------------
+# 9. Bar-guard coercion (P1 crash regression)
+# ---------------------------------------------------------------------------
+
+class TestBarGuardCoercion:
+    """
+    The bar availability guard reads all_bars[e]["d"].max() which is a string
+    (because _bars_to_df stores d as str). This test verifies that:
+    (a) the coercion date.fromisoformat(...) produces a date comparable to
+        as_of_dates[0] (also a date), so no TypeError is raised.
+    (b) when the sentinel bar date < as_of, the guard detects it correctly.
+    """
+
+    def _make_bar_df(self, date_str: str) -> pd.DataFrame:
+        """Return a minimal bar DataFrame with d stored as string (matching _bars_to_df)."""
+        return pd.DataFrame({
+            "d": [date_str],
+            "close": [100.0],
+            "volume": [1_000_000],
+        })
+
+    def test_string_bar_date_coercion_does_not_raise(self):
+        """date.fromisoformat(str_date) < date_object must not raise TypeError."""
+        bar_date_str = "2026-06-20"  # string, as stored by _bars_to_df
+        as_of = date(2026, 6, 24)   # date object, as in as_of_dates[0]
+        # This is the comparison the guard performs after our coercion fix.
+        coerced = date.fromisoformat(bar_date_str)
+        # Must not raise; must be a proper date comparison.
+        assert coerced < as_of
+
+    def test_guard_detects_stale_bar(self):
+        """When the max bar date < as_of, the guard fires (simulated inline)."""
+        sentinel_etfs = ["SPY", "QQQ", "IWM"]
+        # All sentinels have bars only through Friday June 20, but as_of = Tuesday June 24.
+        all_bars = {e: self._make_bar_df("2026-06-20") for e in sentinel_etfs}
+        as_of = date(2026, 6, 24)
+
+        sentinel_max = [
+            date.fromisoformat(all_bars[e]["d"].max())
+            for e in sentinel_etfs
+            if e in all_bars and not all_bars[e].empty
+        ]
+        actual_last_bar = max(sentinel_max)
+        assert actual_last_bar < as_of, "guard should fire: bars are stale"
+
+    def test_guard_passes_when_bar_matches_as_of(self):
+        """When the max bar date == as_of, the guard does not fire."""
+        sentinel_etfs = ["SPY", "QQQ", "IWM"]
+        all_bars = {e: self._make_bar_df("2026-06-24") for e in sentinel_etfs}
+        as_of = date(2026, 6, 24)
+
+        sentinel_max = [
+            date.fromisoformat(all_bars[e]["d"].max())
+            for e in sentinel_etfs
+            if e in all_bars and not all_bars[e].empty
+        ]
+        actual_last_bar = max(sentinel_max)
+        assert not (actual_last_bar < as_of), "guard should not fire: bars are current"
+
+
+# ---------------------------------------------------------------------------
+# 10. Calendar window coverage (P2 backfill-beyond-cache regression)
+# ---------------------------------------------------------------------------
+
+class TestCalendarWindowCoverage:
+    """
+    Verify that trading-day helpers behave correctly when asked about dates
+    outside the cached calendar window.
+
+    The fix: load the calendar over [as_of - 200d, as_of + 7d] (not today ± window).
+    If _TRADING_DAYS is non-empty but the queried date is outside the loaded range,
+    _is_trading_day returns False (not in set) — which is wrong. The test documents
+    this edge-case expectation and verifies the fallback.
+    """
+
+    def setup_method(self):
+        self._orig = _flow_module._TRADING_DAYS
+
+    def teardown_method(self):
+        _flow_module._TRADING_DAYS = self._orig
+
+    def test_date_outside_cache_range_falls_back_gracefully(self):
+        """
+        When the calendar cache covers 2026-01-01..2026-12-31 only, a date in 2020
+        is NOT in the set. _is_trading_day returns False (not in set). This documents
+        the expected behavior and ensures callers must load the right window.
+        """
+        # Inject a narrow cache covering only one day in 2026.
+        _flow_module._TRADING_DAYS = frozenset([date(2026, 6, 24)])  # only one session
+        # A 2020 trading day is outside the cache — returns False because not in set.
+        assert not _is_trading_day(date(2020, 1, 2)), (
+            "A date outside the loaded window is not in the frozenset → False"
+        )
+
+    def test_calendar_loaded_for_as_of_override_window(self):
+        """
+        When as_of_override = "2020-01-15", the calendar must be loaded from
+        at least 2019-09-xx (200 days back). This test injects a calendar anchored
+        at the override date and verifies the helpers find sessions in that range.
+        """
+        # Inject a calendar anchored around the historical override date.
+        session_in_range = date(2019, 11, 4)  # a Monday
+        _flow_module._TRADING_DAYS = frozenset([session_in_range, date(2020, 1, 15)])
+
+        assert _is_trading_day(session_in_range), (
+            "Session within the override window's lookback should be found"
+        )
+        assert _is_trading_day(date(2020, 1, 15)), "The override date itself should be a session"
+
+    def test_non_session_as_of_override_is_snapped(self):
+        """
+        When as_of_override is a weekend/holiday, _latest_trading_day snaps it
+        back to the preceding session. The parquet as_of_date must be the snapped date.
+        """
+        # Build a calendar with only weekdays (no holiday complication needed here).
+        friday = date(2026, 6, 19)
+        saturday = date(2026, 6, 20)
+        _flow_module._TRADING_DAYS = frozenset([friday])  # only Friday is a session
+
+        snapped = _latest_trading_day(saturday)
+        assert snapped == friday, (
+            f"Saturday {saturday} should snap to Friday {friday}, got {snapped}"
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

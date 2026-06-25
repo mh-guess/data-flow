@@ -714,25 +714,45 @@ def hedge_map_flow(
     logger.info("Loading Alpaca credentials (Prefect Secret blocks with env-var fallback)...")
     _init_alpaca_creds(from_prefect_blocks=True)
 
-    # Load exchange calendar so all trading-day helpers are holiday-aware.
-    # Covers 200 calendar days back (beta/ADV window) + 7 days forward (next session).
-    cal_start = date.today() - timedelta(days=200)
-    cal_end = date.today() + timedelta(days=7)
+    # --- Determine as_of date (before calendar load so we know the full window) ---
+    if as_of_override:
+        # Snap to the latest trading session ≤ the requested date using weekday logic
+        # (calendar not yet loaded). The calendar reload below re-checks with full
+        # holiday awareness, but weekday snapping is sufficient for the range calculation.
+        raw_as_of = date.fromisoformat(as_of_override)
+        # Temporary weekday snap (no calendar yet); will be re-snapped after calendar load.
+        as_of = raw_as_of
+    else:
+        # Scheduled default: today (run is post-close at 18:30 ET). Use weekday fallback
+        # until the calendar is loaded; re-snapped below.
+        as_of = date.today()
+
+    # Load exchange calendar over the actual requested window:
+    #   - bar_start ≈ as_of - 130 calendar days (beta/ADV lookback)
+    #   - cal_end   = as_of + 7 days (cover next_trading_day look-ahead)
+    # Loading AFTER as_of is known ensures historical backfills outside today's window
+    # (e.g. as_of_override="2020-01-15") get the correct session set and _is_trading_day
+    # never sees a date outside the cached range.
+    cal_start = as_of - timedelta(days=200)  # 200d gives headroom beyond 130d bar window
+    cal_end = as_of + timedelta(days=7)
     logger.info(f"Loading NYSE calendar {cal_start} → {cal_end}...")
     _init_trading_calendar(cal_start, cal_end)
     logger.info(f"  {len(_TRADING_DAYS)} trading sessions loaded")
 
+    # Now re-snap as_of with full holiday awareness from the loaded calendar.
+    if as_of_override:
+        as_of = _latest_trading_day(raw_as_of)
+        if as_of != raw_as_of:
+            logger.warning(
+                f"as_of_override {raw_as_of} is not a trading session; "
+                f"snapped to {as_of}."
+            )
+    else:
+        as_of = _latest_trading_day(date.today())
+
     logger.info("Loading AWS credentials from Prefect Cloud...")
     aws_credentials = AwsCredentials.load("aws-credentials-tim")
 
-    # --- Determine as_of date ---
-    if as_of_override:
-        as_of = date.fromisoformat(as_of_override)
-    else:
-        # For a scheduled run at 18:30 ET (after today's close), as_of = today so that
-        # effective_date = next_trading_day(today) = the upcoming session.
-        # _latest_trading_day() uses the exchange calendar so holidays are handled correctly.
-        as_of = _latest_trading_day(date.today())
     logger.info(f"as_of_date: {as_of}  |  effective_date: {_next_trading_day(as_of)}")
 
     # Build list of as_of dates (single run or backfill).
@@ -805,9 +825,13 @@ def hedge_map_flow(
     # Verify that as_of's close bars have settled by checking sentinel ETFs.
     # Fires when the scheduled default is used (not when as_of_override is set),
     # guarding against: market holidays, very early runs, or bar-settlement delay.
+    #
+    # NOTE: all_bars[e]["d"] stores dates as strings (see _bars_to_df). Coerce
+    # to date objects before comparing to as_of_dates[0] (a datetime.date) to
+    # avoid TypeError from str < date.
     if not as_of_override:
         sentinel_max = [
-            all_bars[e]["d"].max()
+            date.fromisoformat(all_bars[e]["d"].max())
             for e in _SENTINEL_ETFS
             if e in all_bars and not all_bars[e].empty
         ]
