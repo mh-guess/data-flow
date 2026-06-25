@@ -38,6 +38,8 @@ from hedge_map_flow import (
     _next_trading_day,
     _latest_trading_day,
     _prior_trading_day,
+    _trading_days_before,
+    _is_trading_day,
     _init_alpaca_creds,
     SYMBOL_REMAP,
     ALPACA_KEY_BLOCK,
@@ -784,6 +786,91 @@ class TestScheduledDefault:
         assert old_effective == today, "old logic produces stale effective_date = today"
         assert new_effective == today + timedelta(days=1), "new logic produces effective_date = tomorrow"
         assert new_effective > old_effective, "new logic always produces a later effective_date"
+
+
+# ---------------------------------------------------------------------------
+# 8. Exchange calendar helpers (P2)
+# ---------------------------------------------------------------------------
+
+class TestCalendarHelpers:
+    """
+    Verify calendar-aware helpers behave correctly with and without a loaded calendar.
+    Tests run offline (no Alpaca call) — _TRADING_DAYS stays empty so helpers fall
+    back to weekday logic, and specific holiday tests inject a fake calendar.
+    """
+
+    def setup_method(self):
+        """Save original _TRADING_DAYS before each test."""
+        self._orig_trading_days = _flow_module._TRADING_DAYS
+
+    def teardown_method(self):
+        """Restore original _TRADING_DAYS after each test."""
+        _flow_module._TRADING_DAYS = self._orig_trading_days
+
+    def test_is_trading_day_falls_back_to_weekday_when_calendar_empty(self):
+        """When _TRADING_DAYS is empty, _is_trading_day returns weekday logic."""
+        _flow_module._TRADING_DAYS = frozenset()
+        monday = date(2026, 6, 22)
+        saturday = date(2026, 6, 20)
+        assert monday.weekday() == 0
+        assert saturday.weekday() == 5
+        assert _is_trading_day(monday) is True
+        assert _is_trading_day(saturday) is False
+
+    def test_is_trading_day_uses_calendar_when_loaded(self):
+        """When _TRADING_DAYS is loaded, _is_trading_day checks the set."""
+        monday = date(2026, 6, 22)
+        friday = date(2026, 6, 19)
+        # Inject a calendar that includes only Friday (Monday is a "holiday" in this fiction).
+        _flow_module._TRADING_DAYS = frozenset([friday])
+        assert _is_trading_day(friday) is True
+        assert _is_trading_day(monday) is False  # not in the injected set
+
+    def test_next_trading_day_skips_holiday(self):
+        """With calendar loaded, _next_trading_day skips a holiday (not just weekends)."""
+        # Simulate July 4 (Friday) as a holiday; next session = Monday July 7.
+        friday = date(2026, 7, 3)   # day before holiday
+        holiday = date(2026, 7, 4)  # Independence Day (Saturday this year — let's use
+                                    # a real example: 2025-07-04 is a Friday)
+        friday_2025 = date(2025, 7, 3)
+        holiday_2025 = date(2025, 7, 4)
+        monday_2025 = date(2025, 7, 7)
+        # Build a calendar that has Thursday and Monday but not Friday (holiday).
+        _flow_module._TRADING_DAYS = frozenset([
+            date(2025, 7, 3),   # Thursday
+            date(2025, 7, 7),   # following Monday
+        ])
+        assert _next_trading_day(date(2025, 7, 3)) == date(2025, 7, 7), \
+            "next_trading_day should skip holiday Friday and return Monday"
+
+    def test_latest_trading_day_skips_holiday(self):
+        """_latest_trading_day walks back past a holiday."""
+        # Build a calendar: Wednesday the 2nd is a session; Thursday the 3rd is a holiday.
+        _flow_module._TRADING_DAYS = frozenset([
+            date(2025, 7, 2),   # Wednesday
+            date(2025, 7, 7),   # Monday after holiday weekend
+        ])
+        # On July 3 (holiday in our fake calendar), should return July 2.
+        assert _latest_trading_day(date(2025, 7, 3)) == date(2025, 7, 2)
+
+    def test_prior_trading_day_skips_holiday(self):
+        """_prior_trading_day walks back past a holiday."""
+        _flow_module._TRADING_DAYS = frozenset([
+            date(2025, 7, 2),   # Wednesday
+            date(2025, 7, 7),   # Monday
+        ])
+        # prior_trading_day(Monday July 7) should return Wednesday July 2 (skipping holiday Fri/weekend).
+        assert _prior_trading_day(date(2025, 7, 7)) == date(2025, 7, 2)
+
+    def test_trading_days_before_skips_holiday(self):
+        """_trading_days_before skips holidays correctly."""
+        _flow_module._TRADING_DAYS = frozenset([
+            date(2025, 7, 7),  # Monday
+            date(2025, 7, 2),  # Wednesday
+            date(2025, 7, 1),  # Tuesday
+        ])
+        result = _trading_days_before(date(2025, 7, 7), 3)
+        assert result == [date(2025, 7, 7), date(2025, 7, 2), date(2025, 7, 1)]
 
 
 if __name__ == "__main__":

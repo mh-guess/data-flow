@@ -40,6 +40,7 @@ from hedge_map_flow import (
     MIN_N_OBS,
     ADV_MIN_USD,
     _init_alpaca_creds,
+    _init_trading_calendar,
     _alpaca_headers,
     _get,
     _fetch_multi_bars_page,
@@ -160,6 +161,12 @@ def run(
 
     # Initialize Alpaca creds from env vars (no Prefect blocks in local runner).
     _init_alpaca_creds(from_prefect_blocks=False)
+
+    # Load exchange calendar so holiday-aware helpers work correctly.
+    cal_start = date.today() - timedelta(days=200)
+    cal_end = date.today() + timedelta(days=7)
+    print(f"  Loading NYSE calendar {cal_start} → {cal_end}...")
+    _init_trading_calendar(cal_start, cal_end)
 
     s3 = boto3.client("s3", region_name="us-east-1")
 

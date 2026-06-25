@@ -42,14 +42,37 @@ from hedge_map_flow import (
 )
 
 HERE = os.path.dirname(__file__)
-RESEARCH_DIR = "/Users/timhuang/projects/algo-trade/research/motley_fool/etf_hedge"
-HEDGE_RESOLVED = os.path.join(RESEARCH_DIR, "hedge_resolved.csv")
+
+# Fallback resolution order for hedge_resolved.csv:
+#   1. --hedge-resolved CLI arg (resolved in main())
+#   2. HEDGE_RESOLVED_PATH env var
+#   3. Research directory (developer machine)
+#   4. Bundled fixture (CI / any machine)
+_RESEARCH_DEFAULT = "/Users/timhuang/projects/algo-trade/research/motley_fool/etf_hedge/hedge_resolved.csv"
+_FIXTURE_DEFAULT = os.path.join(HERE, "tests", "fixtures", "hedge_resolved.csv")
 
 # Initialize Alpaca credentials from env vars (parity_check.py runs locally, not via Prefect).
 _init_alpaca_creds(from_prefect_blocks=False)
 
 BETA_TOL = 0.05    # tolerance for beta comparison (absolute)
 R2_TOL = 0.02     # tolerance for r2 comparison (absolute)
+
+
+def _resolve_hedge_resolved_path(cli_arg: Optional[str] = None) -> str:
+    """Return the path to hedge_resolved.csv, trying sources in priority order."""
+    if cli_arg:
+        return cli_arg
+    env = os.environ.get("HEDGE_RESOLVED_PATH")
+    if env:
+        return env
+    if os.path.exists(_RESEARCH_DEFAULT):
+        return _RESEARCH_DEFAULT
+    if os.path.exists(_FIXTURE_DEFAULT):
+        return _FIXTURE_DEFAULT
+    raise FileNotFoundError(
+        "hedge_resolved.csv not found. Pass --hedge-resolved <path>, set "
+        "HEDGE_RESOLVED_PATH, or ensure the research directory is available."
+    )
 
 
 def fetch_bars_for_symbols(
@@ -100,9 +123,11 @@ def get_etf_shortability(etfs: list[str]) -> dict[str, bool]:
     return shortable
 
 
-def main():
+def main(hedge_resolved_path: Optional[str] = None):
+    hedge_resolved = _resolve_hedge_resolved_path(hedge_resolved_path)
+    print(f"Using hedge_resolved: {hedge_resolved}")
     # Load research resolved hedge.
-    research = pd.read_csv(HEDGE_RESOLVED)
+    research = pd.read_csv(hedge_resolved)
     research["date"] = pd.to_datetime(research["date"]).dt.date
     # Only rows with a valid hedge.
     research = research[research["best_etf"].notna()].copy()
@@ -272,6 +297,17 @@ def main():
 
 
 if __name__ == "__main__":
-    df = main()
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Parity check against research hedge_resolved.csv")
+    ap.add_argument(
+        "--hedge-resolved",
+        dest="hedge_resolved",
+        default=None,
+        help="Path to hedge_resolved.csv (overrides HEDGE_RESOLVED_PATH env var and defaults)",
+    )
+    args = ap.parse_args()
+
+    df = main(hedge_resolved_path=args.hedge_resolved)
     df.to_csv("/tmp/parity_results.csv", index=False)
     print("\nFull results saved to /tmp/parity_results.csv")

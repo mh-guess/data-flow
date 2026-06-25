@@ -92,6 +92,14 @@ TOP_N_HEDGES = 3            # store top-3 hedges per ticker
 ALPACA_BATCH_SIZE = 100     # symbols per multi-bar request
 ALPACA_RATE_DELAY = 0.35    # seconds between batches (~170 req/min, under 200)
 ALPACA_RETRY_DELAYS = [10, 30, 60]  # 429/5xx back-off seconds
+ALPACA_BROKER_BASE = "https://paper-api.alpaca.markets/v2"
+
+# ETFs checked to verify that as_of bars have settled before committing to the date.
+_SENTINEL_ETFS = ["SPY", "QQQ", "IWM"]
+
+# Exchange calendar: populated by _init_trading_calendar() at flow start.
+# Helpers fall back to weekday logic when empty (unit tests, offline mode).
+_TRADING_DAYS: frozenset[date] = frozenset()
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +154,48 @@ def _alpaca_headers() -> dict[str, str]:
         "APCA-API-KEY-ID": _alpaca_key,
         "APCA-API-SECRET-KEY": _alpaca_secret,
     }
+
+
+def _fetch_alpaca_calendar(start: date, end: date) -> frozenset[date]:
+    """
+    Fetch NYSE/US market open sessions from Alpaca broker calendar API.
+
+    Returns a frozenset of date objects for every trading session in [start, end].
+    Uses two attempts with a 5-second delay before propagating the error.
+    """
+    url = f"{ALPACA_BROKER_BASE}/calendar"
+    params = {"start": start.isoformat(), "end": end.isoformat()}
+    for attempt in range(2):
+        try:
+            r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=30)
+            r.raise_for_status()
+            sessions = r.json()  # list of {"date": "YYYY-MM-DD", "open": "HH:MM", "close": "HH:MM"}
+            return frozenset(date.fromisoformat(s["date"]) for s in sessions)
+        except Exception:
+            if attempt == 0:
+                time.sleep(5)
+            else:
+                raise
+    return frozenset()  # unreachable
+
+
+def _init_trading_calendar(start: date, end: date) -> None:
+    """
+    Populate the module-level _TRADING_DAYS cache from Alpaca's calendar API.
+
+    Call once at flow/script start after _init_alpaca_creds(). All trading-day
+    helpers (is_trading_day, _next_trading_day, etc.) use this cache and fall
+    back to weekday logic when it's empty (unit tests, offline mode).
+    """
+    global _TRADING_DAYS
+    _TRADING_DAYS = _fetch_alpaca_calendar(start, end)
+
+
+def _is_trading_day(d: date) -> bool:
+    """True if d is a known NYSE session, or a weekday when calendar is not loaded."""
+    if _TRADING_DAYS:
+        return d in _TRADING_DAYS
+    return d.weekday() < 5  # Mon–Fri fallback for tests / offline use
 
 
 def _get(url: str, params: dict, retries: int = 3) -> dict:
@@ -525,12 +575,9 @@ def compute_hedge_map(
 
 
 def _next_trading_day(d: date) -> date:
-    """
-    Return the next calendar day that is Mon–Fri.
-    (Good enough approximation; holidays handled by the job not running on holidays.)
-    """
+    """First trading session after d. Uses exchange calendar when loaded."""
     nxt = d + timedelta(days=1)
-    while nxt.weekday() >= 5:  # 5=Sat, 6=Sun
+    while not _is_trading_day(nxt):
         nxt += timedelta(days=1)
     return nxt
 
@@ -667,6 +714,14 @@ def hedge_map_flow(
     logger.info("Loading Alpaca credentials (Prefect Secret blocks with env-var fallback)...")
     _init_alpaca_creds(from_prefect_blocks=True)
 
+    # Load exchange calendar so all trading-day helpers are holiday-aware.
+    # Covers 200 calendar days back (beta/ADV window) + 7 days forward (next session).
+    cal_start = date.today() - timedelta(days=200)
+    cal_end = date.today() + timedelta(days=7)
+    logger.info(f"Loading NYSE calendar {cal_start} → {cal_end}...")
+    _init_trading_calendar(cal_start, cal_end)
+    logger.info(f"  {len(_TRADING_DAYS)} trading sessions loaded")
+
     logger.info("Loading AWS credentials from Prefect Cloud...")
     aws_credentials = AwsCredentials.load("aws-credentials-tim")
 
@@ -676,8 +731,7 @@ def hedge_map_flow(
     else:
         # For a scheduled run at 18:30 ET (after today's close), as_of = today so that
         # effective_date = next_trading_day(today) = the upcoming session.
-        # Using _latest_trading_day() instead of _prior_trading_day() ensures the run
-        # produces a partition the NEXT session can read, not one for today (already past).
+        # _latest_trading_day() uses the exchange calendar so holidays are handled correctly.
         as_of = _latest_trading_day(date.today())
     logger.info(f"as_of_date: {as_of}  |  effective_date: {_next_trading_day(as_of)}")
 
@@ -747,6 +801,30 @@ def hedge_map_flow(
 
     logger.info(f"Bars loaded: {sum(1 for df in all_bars.values() if not df.empty)}/{len(all_symbols)} symbols")
 
+    # --- Bar availability guard ---
+    # Verify that as_of's close bars have settled by checking sentinel ETFs.
+    # Fires when the scheduled default is used (not when as_of_override is set),
+    # guarding against: market holidays, very early runs, or bar-settlement delay.
+    if not as_of_override:
+        sentinel_max = [
+            all_bars[e]["d"].max()
+            for e in _SENTINEL_ETFS
+            if e in all_bars and not all_bars[e].empty
+        ]
+        if sentinel_max:
+            actual_last_bar: date = max(sentinel_max)
+            if actual_last_bar < as_of_dates[0]:
+                logger.warning(
+                    f"Bar availability guard: latest settled bar is {actual_last_bar}, "
+                    f"expected {as_of_dates[0]}. Adjusting as_of → {actual_last_bar}. "
+                    "Likely cause: market holiday or bars not yet settled."
+                )
+                as_of_dates = (
+                    _trading_days_before(actual_last_bar, backfill_days)
+                    if backfill_days > 0
+                    else [actual_last_bar]
+                )
+
     # --- Process each as_of date ---
     results: list[dict] = []
     for run_as_of in as_of_dates:
@@ -802,37 +880,32 @@ def hedge_map_flow(
 
 def _latest_trading_day(d: date) -> date:
     """
-    Return `d` itself if it is Mon–Fri (a trading weekday), otherwise the most recent
-    weekday before `d`.
+    Most recent trading session <= d. Uses exchange calendar when loaded.
 
-    Use for the scheduled-run default: a run at 18:30 ET on trading day X should set
-    as_of = X so that effective_date = next_trading_day(X) = the upcoming session.
+    For the scheduled-run default: a run at 18:30 ET on trading day X returns X
+    so that effective_date = next_trading_day(X) = the upcoming session.
+    On a market holiday, walks back to the preceding session.
     """
     candidate = d
-    while candidate.weekday() >= 5:  # 5=Sat, 6=Sun
+    while not _is_trading_day(candidate):
         candidate -= timedelta(days=1)
     return candidate
 
 
 def _prior_trading_day(d: date) -> date:
-    """
-    Return the most recent Mon–Fri strictly before `d`.
-
-    Kept for backfill helpers and tests; the scheduled-run default uses
-    _latest_trading_day() instead.
-    """
+    """Most recent trading session strictly before d. Uses exchange calendar when loaded."""
     candidate = d - timedelta(days=1)
-    while candidate.weekday() >= 5:
+    while not _is_trading_day(candidate):
         candidate -= timedelta(days=1)
     return candidate
 
 
 def _trading_days_before(end: date, n: int) -> list[date]:
-    """Return a list of n Mon–Fri dates ending at `end`, most-recent-first."""
+    """n trading sessions ending at end, most-recent-first. Uses exchange calendar when loaded."""
     days: list[date] = []
     candidate = end
     while len(days) < n:
-        if candidate.weekday() < 5:
+        if _is_trading_day(candidate):
             days.append(candidate)
         candidate -= timedelta(days=1)
     return days
