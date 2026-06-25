@@ -270,10 +270,12 @@ def run(
         print(f"  Parquet written: {parquet_uri}")
 
         # Write manifest.
+        # Use beta_as_of (the actual last close used for betas/ADV) — not run_as_of —
+        # so the manifest matches the as_of_date written into the parquet rows.
         coverage_pct = round(covered / eligible_count * 100.0, 2) if eligible_count > 0 else 0.0
         manifest = {
             "effective_date": effective_date.isoformat(),
-            "as_of_date": run_as_of.isoformat(),
+            "as_of_date": beta_as_of.isoformat(),
             "universe_size": len(universe),
             "eligible_count": eligible_count,
             "coverage_pct": coverage_pct,

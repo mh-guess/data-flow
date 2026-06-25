@@ -958,8 +958,18 @@ def hedge_map_flow(
                 "manifest_uri": manifest_uri,
             })
         else:
-            logger.warning(f"  No hedge map rows produced for as_of={run_as_of}")
-            results.append({"as_of": run_as_of.isoformat(), "error": "empty_hedge_map"})
+            if subset_symbols:
+                # Subset/test run: lenient — log and continue so partial test runs complete.
+                logger.warning(f"  No hedge map rows for as_of={run_as_of} (subset run; continuing)")
+                results.append({"as_of": run_as_of.isoformat(), "error": "empty_hedge_map"})
+            else:
+                # Full-universe scheduled run: an empty map means data/metadata outage.
+                # Fail loudly so alerting fires — silently producing no hedge is worse.
+                raise RuntimeError(
+                    f"compute_hedge_map returned zero rows for as_of={run_as_of} "
+                    f"(eligible={eligible_count}). This indicates a data or metadata "
+                    "outage; fix the root cause before the next run."
+                )
 
     logger.info("=" * 60)
     logger.info("Hedge Map ETL Flow completed")
