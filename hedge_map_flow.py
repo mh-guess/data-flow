@@ -586,6 +586,72 @@ def compute_hedge_map(
     return df_out
 
 
+def _check_bar_availability(
+    all_bars: dict[str, pd.DataFrame],
+    as_of_dates: list[date],
+    skip: bool = False,
+) -> dict[date, date]:
+    """
+    Bar availability guard: verify that the expected close bars have settled by
+    checking all sentinel ETFs (SPY, QQQ, IWM).
+
+    Uses min() over sentinel last-bar dates so that a close is only considered
+    settled when EVERY sentinel has it — the laggard, not the leader, determines
+    availability. If any sentinel is missing entirely it is treated as not settled.
+
+    KEY INVARIANT: effective_date must never rewind due to bar lag. The returned
+    dict maps {run_as_of: beta_as_of} only for dates where beta_as_of < run_as_of;
+    callers use run_as_of for effective_date and beta_as_of for the beta/ADV window.
+
+    Args:
+        all_bars: symbol → bar DataFrame (d column stored as str by _bars_to_df).
+        as_of_dates: list of dates to check, most-recent-first.
+        skip: when True (explicit --as-of override), returns {} immediately.
+
+    Returns:
+        {run_as_of: beta_as_of} for every as_of date whose bars haven't fully settled.
+        Empty dict when all bars are current or skip=True.
+    """
+    import logging
+    log = logging.getLogger(__name__)
+
+    if skip:
+        return {}
+
+    # Collect the last available bar date for each sentinel.
+    # min() requires ALL sentinels present; any missing sentinel is treated as not settled.
+    sentinel_last: list[date] = []
+    for etf in _SENTINEL_ETFS:
+        df = all_bars.get(etf)
+        if df is None or df.empty:
+            # Sentinel missing — treat as fully lagged (use as_of_dates[-1] as floor).
+            log.warning(f"Bar availability guard: sentinel {etf} has no bar data.")
+            sentinel_last.append(date.min)
+        else:
+            sentinel_last.append(date.fromisoformat(df["d"].max()))
+
+    # The close is settled only when the SLOWEST sentinel has it (min, not max).
+    actual_last_bar: date = min(sentinel_last)
+    if actual_last_bar == date.min:
+        # At least one sentinel entirely absent — treat as not settled.
+        actual_last_bar = _prior_trading_day(as_of_dates[0])
+
+    overrides: dict[date, date] = {}
+    for d in as_of_dates:
+        if actual_last_bar < d:
+            overrides[d] = actual_last_bar
+
+    if overrides:
+        log.warning(
+            f"Bar availability guard: slowest sentinel last bar is {actual_last_bar}, "
+            f"expected {as_of_dates[0]}. Beta window capped at {actual_last_bar} for "
+            f"{len(overrides)} date(s); effective_date(s) unchanged (upcoming session). "
+            "Likely cause: market holiday or bars not yet settled."
+        )
+
+    return overrides
+
+
 def _next_trading_day(d: date) -> date:
     """First trading session after d. Uses exchange calendar when loaded."""
     nxt = d + timedelta(days=1)
@@ -836,39 +902,8 @@ def hedge_map_flow(
     logger.info(f"Bars loaded: {sum(1 for df in all_bars.values() if not df.empty)}/{len(all_symbols)} symbols")
 
     # --- Bar availability guard ---
-    # Verify that as_of's close bars have settled by checking sentinel ETFs (SPY/QQQ/IWM).
-    # Only fires on the scheduled default path (not --as-of override) since that path
-    # is the one whose as_of is anchored to today's expected close.
-    #
-    # KEY INVARIANT: effective_date (the session this partition is FOR) must never be
-    # rewound because bars are late — the upcoming session's map must always be written.
-    # When bars lag, we keep effective_date = next_trading_day(as_of_dates[0]) and only
-    # pull the beta/ADV window back to the freshest settled close (beta_as_of). The
-    # parquet records as_of_date = beta_as_of (honest last close) and
-    # effective_date = next_trading_day(original_as_of) (the session it serves).
-    #
-    # NOTE: _bars_to_df stores "d" as str; coerce to date before comparing to date objects.
-    beta_as_of_overrides: dict[date, date] = {}  # {run_as_of: beta_as_of} for lagged days
-    if not as_of_override:
-        sentinel_max = [
-            date.fromisoformat(all_bars[e]["d"].max())
-            for e in _SENTINEL_ETFS
-            if e in all_bars and not all_bars[e].empty
-        ]
-        if sentinel_max:
-            actual_last_bar: date = max(sentinel_max)
-            if actual_last_bar < as_of_dates[0]:
-                logger.warning(
-                    f"Bar availability guard: latest settled bar is {actual_last_bar}, "
-                    f"expected {as_of_dates[0]}. Beta window will use {actual_last_bar}; "
-                    f"effective_date stays {_next_trading_day(as_of_dates[0])} (upcoming session). "
-                    "Likely cause: market holiday or bars not yet settled."
-                )
-                # For all dates in as_of_dates that are newer than actual_last_bar,
-                # the beta window is capped at actual_last_bar.
-                for d in as_of_dates:
-                    if d > actual_last_bar:
-                        beta_as_of_overrides[d] = actual_last_bar
+    # Only fires on the scheduled default path (not --as-of override).
+    beta_as_of_overrides = _check_bar_availability(all_bars, as_of_dates, as_of_override is not None)
 
     # --- Process each as_of date ---
     results: list[dict] = []

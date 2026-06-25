@@ -34,6 +34,7 @@ from hedge_map_flow import (
     compute_adv,
     compute_eligibility,
     compute_hedge_map,
+    _check_bar_availability,
     _compute_returns,
     _next_trading_day,
     _latest_trading_day,
@@ -44,6 +45,7 @@ from hedge_map_flow import (
     SYMBOL_REMAP,
     ALPACA_KEY_BLOCK,
     ALPACA_SECRET_BLOCK,
+    _SENTINEL_ETFS,
 )
 import hedge_map_flow as _flow_module
 
@@ -874,16 +876,19 @@ class TestCalendarHelpers:
 
 
 # ---------------------------------------------------------------------------
-# 9. Bar-guard coercion (P1 crash regression)
+# 9. Bar-guard: _check_bar_availability (shared helper)
 # ---------------------------------------------------------------------------
 
 class TestBarGuardCoercion:
     """
-    The bar availability guard reads all_bars[e]["d"].max() which is a string
-    (because _bars_to_df stores d as str). This test verifies that:
-    (a) the coercion date.fromisoformat(...) produces a date comparable to
-        as_of_dates[0] (also a date), so no TypeError is raised.
-    (b) when the sentinel bar date < as_of, the guard detects it correctly.
+    Tests for _check_bar_availability — the shared bar-lag guard extracted into
+    hedge_map_flow.py and called from both the Prefect flow and run_local.py.
+
+    Key invariants:
+    - Uses min() over sentinels: ALL must have settled, not just the leader.
+    - String-typed d column (as stored by _bars_to_df) coerced without TypeError.
+    - skip=True returns {} (--as-of override path).
+    - Returns {run_as_of: beta_as_of} mapping; never modifies as_of_dates.
     """
 
     def _make_bar_df(self, date_str: str) -> pd.DataFrame:
@@ -895,42 +900,81 @@ class TestBarGuardCoercion:
         })
 
     def test_string_bar_date_coercion_does_not_raise(self):
-        """date.fromisoformat(str_date) < date_object must not raise TypeError."""
-        bar_date_str = "2026-06-20"  # string, as stored by _bars_to_df
-        as_of = date(2026, 6, 24)   # date object, as in as_of_dates[0]
-        # This is the comparison the guard performs after our coercion fix.
+        """date.fromisoformat(str_date) compared to date object must not raise TypeError."""
+        bar_date_str = "2026-06-20"
+        as_of = date(2026, 6, 24)
         coerced = date.fromisoformat(bar_date_str)
-        # Must not raise; must be a proper date comparison.
-        assert coerced < as_of
+        assert coerced < as_of  # must be a proper date comparison, no TypeError
 
-    def test_guard_detects_stale_bar(self):
-        """When the max bar date < as_of, the guard fires (simulated inline)."""
-        sentinel_etfs = ["SPY", "QQQ", "IWM"]
-        # All sentinels have bars only through Friday June 20, but as_of = Tuesday June 24.
-        all_bars = {e: self._make_bar_df("2026-06-20") for e in sentinel_etfs}
+    def test_all_sentinels_settled_no_override(self):
+        """When all sentinels have today's bar, guard returns empty dict."""
         as_of = date(2026, 6, 24)
+        all_bars = {e: self._make_bar_df("2026-06-24") for e in _SENTINEL_ETFS}
+        result = _check_bar_availability(all_bars, [as_of], skip=False)
+        assert result == {}, "guard should not fire when all sentinels are current"
 
-        sentinel_max = [
-            date.fromisoformat(all_bars[e]["d"].max())
-            for e in sentinel_etfs
-            if e in all_bars and not all_bars[e].empty
-        ]
-        actual_last_bar = max(sentinel_max)
-        assert actual_last_bar < as_of, "guard should fire: bars are stale"
-
-    def test_guard_passes_when_bar_matches_as_of(self):
-        """When the max bar date == as_of, the guard does not fire."""
-        sentinel_etfs = ["SPY", "QQQ", "IWM"]
-        all_bars = {e: self._make_bar_df("2026-06-24") for e in sentinel_etfs}
+    def test_all_sentinels_stale_fires(self):
+        """When all sentinels lag, guard fires and maps run_as_of to actual_last_bar."""
         as_of = date(2026, 6, 24)
+        all_bars = {e: self._make_bar_df("2026-06-20") for e in _SENTINEL_ETFS}
+        result = _check_bar_availability(all_bars, [as_of], skip=False)
+        assert as_of in result, "guard should fire: all sentinels stale"
+        assert result[as_of] == date(2026, 6, 20)
 
-        sentinel_max = [
-            date.fromisoformat(all_bars[e]["d"].max())
-            for e in sentinel_etfs
-            if e in all_bars and not all_bars[e].empty
-        ]
-        actual_last_bar = max(sentinel_max)
-        assert not (actual_last_bar < as_of), "guard should not fire: bars are current"
+    def test_min_not_max_laggard_determines_availability(self):
+        """
+        When one sentinel is current (2026-06-24) and two are stale (2026-06-20),
+        min() means the stale date wins — the guard fires.
+        Using max() would incorrectly treat the close as settled off the leader.
+        """
+        as_of = date(2026, 6, 24)
+        all_bars = {
+            "SPY": self._make_bar_df("2026-06-24"),  # current
+            "QQQ": self._make_bar_df("2026-06-20"),  # stale
+            "IWM": self._make_bar_df("2026-06-20"),  # stale
+        }
+        result = _check_bar_availability(all_bars, [as_of], skip=False)
+        assert as_of in result, (
+            "guard must fire when ANY sentinel lags (min), not only when ALL lag (max)"
+        )
+        assert result[as_of] == date(2026, 6, 20), (
+            "beta_as_of should be the laggard's date, not the leader's"
+        )
+
+    def test_all_current_leader_not_enough(self):
+        """
+        When all three sentinels are current, guard does not fire even if one
+        is 'ahead' (same result: all settled → no override needed).
+        """
+        as_of = date(2026, 6, 24)
+        all_bars = {e: self._make_bar_df("2026-06-24") for e in _SENTINEL_ETFS}
+        result = _check_bar_availability(all_bars, [as_of], skip=False)
+        assert result == {}
+
+    def test_skip_true_returns_empty_regardless(self):
+        """skip=True (--as-of override path) always returns {} without checking bars."""
+        as_of = date(2026, 6, 24)
+        # Bars are stale but skip=True should bypass the guard entirely.
+        all_bars = {e: self._make_bar_df("2026-06-01") for e in _SENTINEL_ETFS}
+        result = _check_bar_availability(all_bars, [as_of], skip=True)
+        assert result == {}, "skip=True must bypass guard"
+
+    def test_missing_sentinel_treated_as_stale(self):
+        """A sentinel absent from all_bars is treated as not settled."""
+        as_of = date(2026, 6, 24)
+        # Only SPY present; QQQ and IWM missing.
+        all_bars = {"SPY": self._make_bar_df("2026-06-24")}
+        result = _check_bar_availability(all_bars, [as_of], skip=False)
+        assert as_of in result, "missing sentinel should be treated as stale"
+
+    def test_guard_does_not_mutate_as_of_dates(self):
+        """_check_bar_availability must not modify the as_of_dates list."""
+        as_of = date(2026, 6, 24)
+        as_of_dates = [as_of]
+        original = list(as_of_dates)
+        all_bars = {e: self._make_bar_df("2026-06-20") for e in _SENTINEL_ETFS}
+        _check_bar_availability(all_bars, as_of_dates, skip=False)
+        assert as_of_dates == original, "guard must not mutate as_of_dates"
 
 
 # ---------------------------------------------------------------------------

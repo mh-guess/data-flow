@@ -41,6 +41,7 @@ from hedge_map_flow import (
     ADV_MIN_USD,
     _init_alpaca_creds,
     _init_trading_calendar,
+    _check_bar_availability,
     _alpaca_headers,
     _get,
     _fetch_multi_bars_page,
@@ -213,15 +214,36 @@ def run(
     got = sum(1 for df in all_bars.values() if not df.empty)
     print(f"  Bars loaded: {got}/{len(all_symbols)} symbols with data")
 
+    # Bar availability guard — same logic as the deployed flow.
+    # skip=True when --as-of was given explicitly (bars are expected to be historical).
+    beta_as_of_overrides = _check_bar_availability(
+        all_bars, as_of_dates, skip=as_of_override is not None
+    )
+    if beta_as_of_overrides:
+        print(f"  WARNING: bar availability guard fired; beta_as_of adjusted for "
+              f"{len(beta_as_of_overrides)} date(s). See log for details.")
+
     # Process each as_of date.
     results: list[dict] = []
     for run_as_of in as_of_dates:
-        print(f"\nComputing hedge map for as_of={run_as_of}...")
-        elig_df = compute_eligibility(universe, all_bars, run_as_of)
+        beta_as_of = beta_as_of_overrides.get(run_as_of, run_as_of)
+        run_effective_date = _next_trading_day(run_as_of)
+
+        if beta_as_of != run_as_of:
+            print(f"\nComputing hedge map for as_of={run_as_of} "
+                  f"(beta_as_of={beta_as_of}, effective_date={run_effective_date})...")
+        else:
+            print(f"\nComputing hedge map for as_of={run_as_of}...")
+
+        elig_df = compute_eligibility(universe, all_bars, beta_as_of)
         eligible_count = int(elig_df["eligible"].sum())
         print(f"  Eligible: {eligible_count}/{len(universe)}")
 
-        hedge_map = compute_hedge_map(elig_df, all_bars, etf_meta, run_as_of)
+        hedge_map = compute_hedge_map(
+            elig_df, all_bars, etf_meta,
+            as_of=beta_as_of,
+            effective_date=run_effective_date,
+        )
         covered = hedge_map[hedge_map["rank"] == 1]["ticker"].nunique() if not hedge_map.empty else 0
         print(f"  Covered tickers (rank=1): {covered}")
 
@@ -230,7 +252,7 @@ def run(
             results.append({"as_of": run_as_of.isoformat(), "error": "empty_hedge_map"})
             continue
 
-        effective_date = _next_trading_day(run_as_of)
+        effective_date = run_effective_date
 
         # Write parquet.
         hm = hedge_map.copy()
