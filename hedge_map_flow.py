@@ -492,13 +492,27 @@ def compute_hedge_map(
     all_bars: dict[str, pd.DataFrame],
     etf_meta: dict[str, dict],  # {etf_sym -> {shortable, easy_to_borrow}}
     as_of: date,
+    effective_date: Optional[date] = None,
 ) -> pd.DataFrame:
     """
     Compute beta/R² for every eligible stock × every ETF candidate, then select top-3.
 
+    Args:
+        as_of: Last close date whose bars are used for beta/ADV computation.
+               In normal operation this equals the most recent completed session.
+               When bars are lagged (holiday / settlement delay), the caller passes
+               the actual last settled close here while supplying the correct
+               effective_date explicitly.
+        effective_date: The upcoming session this partition is for. Defaults to
+               _next_trading_day(as_of). The caller must pass this explicitly when
+               as_of != the session that determines effective_date (bar-lag case).
+
     etf_meta carries shortability flags (from universe/asset pull for ETF symbols).
     Returns the hedge_map DataFrame (schema-conforming).
     """
+    if effective_date is None:
+        effective_date = _next_trading_day(as_of)
+
     # Pre-compute returns for all ETF candidates; skip those with no bars.
     etf_rets: dict[str, pd.DataFrame] = {}
     etf_advs: dict[str, float] = {}
@@ -542,8 +556,6 @@ def compute_hedge_map(
         # Rank by R² descending; take top-3.
         eligible_cands.sort(key=lambda x: -x[2])
         top3 = eligible_cands[:TOP_N_HEDGES]
-
-        effective_date = _next_trading_day(as_of)
 
         for rank, (etf, beta, r2, n_obs) in enumerate(top3, 1):
             m = meta.get(etf, {})
@@ -728,13 +740,15 @@ def hedge_map_flow(
         as_of = date.today()
 
     # Load exchange calendar over the actual requested window:
-    #   - bar_start ≈ as_of - 130 calendar days (beta/ADV lookback)
-    #   - cal_end   = as_of + 7 days (cover next_trading_day look-ahead)
-    # Loading AFTER as_of is known ensures historical backfills outside today's window
-    # (e.g. as_of_override="2020-01-15") get the correct session set and _is_trading_day
-    # never sees a date outside the cached range.
-    cal_start = as_of - timedelta(days=200)  # 200d gives headroom beyond 130d bar window
+    #   - cal_end   = raw_as_of + 7 days (cover next_trading_day look-ahead)
+    #   - cal_start = raw_as_of - max(200, backfill_days * 2 + 160) calendar days
+    #     so that a large backfill (e.g. backfill_days=250 ≈ 350 calendar days)
+    #     doesn't walk out of the cached range and mis-classify sessions.
+    #     Formula: backfill_days * 2 converts trading-days to calendar-days conservatively,
+    #     + 130d bar-window buffer + 30d holiday headroom.
     cal_end = as_of + timedelta(days=7)
+    cal_window_days = max(200, backfill_days * 2 + 160)
+    cal_start = as_of - timedelta(days=cal_window_days)
     logger.info(f"Loading NYSE calendar {cal_start} → {cal_end}...")
     _init_trading_calendar(cal_start, cal_end)
     logger.info(f"  {len(_TRADING_DAYS)} trading sessions loaded")
@@ -822,13 +836,19 @@ def hedge_map_flow(
     logger.info(f"Bars loaded: {sum(1 for df in all_bars.values() if not df.empty)}/{len(all_symbols)} symbols")
 
     # --- Bar availability guard ---
-    # Verify that as_of's close bars have settled by checking sentinel ETFs.
-    # Fires when the scheduled default is used (not when as_of_override is set),
-    # guarding against: market holidays, very early runs, or bar-settlement delay.
+    # Verify that as_of's close bars have settled by checking sentinel ETFs (SPY/QQQ/IWM).
+    # Only fires on the scheduled default path (not --as-of override) since that path
+    # is the one whose as_of is anchored to today's expected close.
     #
-    # NOTE: all_bars[e]["d"] stores dates as strings (see _bars_to_df). Coerce
-    # to date objects before comparing to as_of_dates[0] (a datetime.date) to
-    # avoid TypeError from str < date.
+    # KEY INVARIANT: effective_date (the session this partition is FOR) must never be
+    # rewound because bars are late — the upcoming session's map must always be written.
+    # When bars lag, we keep effective_date = next_trading_day(as_of_dates[0]) and only
+    # pull the beta/ADV window back to the freshest settled close (beta_as_of). The
+    # parquet records as_of_date = beta_as_of (honest last close) and
+    # effective_date = next_trading_day(original_as_of) (the session it serves).
+    #
+    # NOTE: _bars_to_df stores "d" as str; coerce to date before comparing to date objects.
+    beta_as_of_overrides: dict[date, date] = {}  # {run_as_of: beta_as_of} for lagged days
     if not as_of_override:
         sentinel_max = [
             date.fromisoformat(all_bars[e]["d"].max())
@@ -840,33 +860,51 @@ def hedge_map_flow(
             if actual_last_bar < as_of_dates[0]:
                 logger.warning(
                     f"Bar availability guard: latest settled bar is {actual_last_bar}, "
-                    f"expected {as_of_dates[0]}. Adjusting as_of → {actual_last_bar}. "
+                    f"expected {as_of_dates[0]}. Beta window will use {actual_last_bar}; "
+                    f"effective_date stays {_next_trading_day(as_of_dates[0])} (upcoming session). "
                     "Likely cause: market holiday or bars not yet settled."
                 )
-                as_of_dates = (
-                    _trading_days_before(actual_last_bar, backfill_days)
-                    if backfill_days > 0
-                    else [actual_last_bar]
-                )
+                # For all dates in as_of_dates that are newer than actual_last_bar,
+                # the beta window is capped at actual_last_bar.
+                for d in as_of_dates:
+                    if d > actual_last_bar:
+                        beta_as_of_overrides[d] = actual_last_bar
 
     # --- Process each as_of date ---
     results: list[dict] = []
     for run_as_of in as_of_dates:
-        logger.info(f"Computing hedge map for as_of={run_as_of}...")
+        # beta_as_of: the last settled close used for betas/ADV. Normally equals run_as_of.
+        # When the bar-lag guard fires, it's the most recent available bar date.
+        beta_as_of = beta_as_of_overrides.get(run_as_of, run_as_of)
+        # effective_date: the session this partition is FOR. Always derived from run_as_of
+        # (the intended date), never from beta_as_of, so bar lag never delays the partition.
+        run_effective_date = _next_trading_day(run_as_of)
 
-        elig_df = compute_eligibility(universe, all_bars, run_as_of)
+        if beta_as_of != run_as_of:
+            logger.info(
+                f"Computing hedge map for as_of={run_as_of} "
+                f"(beta_as_of={beta_as_of}, effective_date={run_effective_date})..."
+            )
+        else:
+            logger.info(f"Computing hedge map for as_of={run_as_of}...")
+
+        elig_df = compute_eligibility(universe, all_bars, beta_as_of)
         eligible_count = int(elig_df["eligible"].sum())
         logger.info(f"  Eligible: {eligible_count}/{len(universe)}")
 
-        hedge_map = compute_hedge_map(elig_df, all_bars, etf_meta, run_as_of)
+        hedge_map = compute_hedge_map(
+            elig_df, all_bars, etf_meta,
+            as_of=beta_as_of,
+            effective_date=run_effective_date,
+        )
         covered = hedge_map[hedge_map["rank"] == 1]["ticker"].nunique()
         logger.info(f"  Covered tickers (rank=1): {covered}")
 
         if not hedge_map.empty:
             s3_uri = write_hedge_map_to_s3(hedge_map, aws_credentials)
             manifest_uri = write_run_manifest(
-                as_of=run_as_of,
-                effective_date=_next_trading_day(run_as_of),
+                as_of=beta_as_of,
+                effective_date=run_effective_date,
                 universe_size=len(universe),
                 eligible_count=eligible_count,
                 covered_tickers=covered,
@@ -874,8 +912,8 @@ def hedge_map_flow(
                 aws_credentials=aws_credentials,
             )
             results.append({
-                "as_of": run_as_of.isoformat(),
-                "effective_date": _next_trading_day(run_as_of).isoformat(),
+                "as_of": beta_as_of.isoformat(),
+                "effective_date": run_effective_date.isoformat(),
                 "universe_size": len(universe),
                 "eligible_count": eligible_count,
                 "covered_tickers": covered,

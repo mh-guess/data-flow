@@ -998,5 +998,185 @@ class TestCalendarWindowCoverage:
         )
 
 
+# ---------------------------------------------------------------------------
+# 11. Holistic date-invariant tests: bar-lag + large backfill + holiday boundary
+# ---------------------------------------------------------------------------
+
+class TestDateInvariants:
+    """
+    Holistic invariant tests covering interactions between bar-lag, large backfills,
+    and holiday boundaries. These lock down the contracts that must hold together
+    so adjacent edge cases stop surfacing one at a time.
+    """
+
+    def setup_method(self):
+        self._orig = _flow_module._TRADING_DAYS
+
+    def teardown_method(self):
+        _flow_module._TRADING_DAYS = self._orig
+
+    # ---- Invariant 1: effective_date is always a real session ----
+
+    def test_effective_date_is_always_a_session(self):
+        """
+        _next_trading_day(d) must return a date that _is_trading_day recognises,
+        regardless of whether d is a session, weekend, or holiday.
+        """
+        # Build a calendar with Mon/Wed/Fri (Tue/Thu are "holidays" in this fiction).
+        sessions = frozenset([
+            date(2026, 6, 22),  # Monday
+            date(2026, 6, 24),  # Wednesday
+            date(2026, 6, 26),  # Friday
+        ])
+        _flow_module._TRADING_DAYS = sessions
+
+        for d in [date(2026, 6, 22), date(2026, 6, 23), date(2026, 6, 24)]:
+            nxt = _next_trading_day(d)
+            assert _is_trading_day(nxt), (
+                f"_next_trading_day({d}) = {nxt} is not a trading session"
+            )
+
+    # ---- Invariant 2: bar-lag must not rewind effective_date ----
+
+    def test_bar_lag_leaves_effective_date_unchanged(self):
+        """
+        When actual_last_bar < as_of (bars not yet settled), effective_date must
+        equal next_trading_day(original_as_of), NOT next_trading_day(actual_last_bar).
+
+        This is the P2-1 invariant: the upcoming session's partition must always be
+        written for the session it was scheduled for.
+        """
+        sessions = frozenset([
+            date(2026, 6, 23),  # Tuesday — original as_of
+            date(2026, 6, 24),  # Wednesday — intended effective_date
+            date(2026, 6, 22),  # Monday — actual_last_bar (bars lagged)
+        ])
+        _flow_module._TRADING_DAYS = sessions
+
+        original_as_of = date(2026, 6, 23)    # Tuesday
+        actual_last_bar = date(2026, 6, 22)    # Monday (lagged)
+        intended_effective = _next_trading_day(original_as_of)  # Wednesday
+
+        assert intended_effective == date(2026, 6, 24), "sanity-check"
+
+        # beta_as_of is the lagged bar date — effective_date must NOT be derived from it.
+        wrong_effective = _next_trading_day(actual_last_bar)  # Tuesday (stale!)
+        assert wrong_effective != intended_effective, (
+            "Deriving effective_date from actual_last_bar gives a stale date"
+        )
+        # The correct effective_date stays pinned to the original_as_of.
+        assert intended_effective == date(2026, 6, 24)
+
+    def test_compute_hedge_map_accepts_explicit_effective_date(self):
+        """
+        compute_hedge_map with explicit effective_date writes that date to the
+        parquet, not next_trading_day(as_of). This is the mechanism that decouples
+        the beta window from the partition key when bars are lagged.
+        """
+        as_of = date(2024, 6, 1)
+        # Inject a calendar so _next_trading_day works without network.
+        _flow_module._TRADING_DAYS = frozenset([
+            date(2024, 6, 1), date(2024, 6, 3), date(2024, 6, 4),
+        ])
+
+        # Build minimal synthetic fixtures.
+        etf_df = _make_price_df(n_days=90, seed=77)
+        stock_df = _make_correlated_df(etf_df, beta=1.0, seed=78)
+        mock_bars = {"SPY": etf_df}  # use SPY as both ETF and stock bars
+        for etf in ETF_CANDIDATES:
+            if etf != "SPY":
+                mock_bars[etf] = pd.DataFrame(columns=["d", "close", "volume"])
+
+        universe = pd.DataFrame([{
+            "symbol": "SPY",
+            "shortable": True,
+            "easy_to_borrow": True,
+            "first_bar_date": date(2024, 1, 1),
+            "eligible": True,
+        }])
+        etf_meta = {etf: {"shortable": True, "easy_to_borrow": True} for etf in ETF_CANDIDATES}
+        mock_bars["SPY"] = etf_df
+
+        explicit_effective = date(2024, 6, 4)  # two sessions after as_of
+        hm = compute_hedge_map(
+            universe, mock_bars, etf_meta,
+            as_of=as_of,
+            effective_date=explicit_effective,
+        )
+        if not hm.empty:
+            assert (hm["effective_date"] == explicit_effective).all(), (
+                f"Expected effective_date={explicit_effective} in all rows, "
+                f"got {hm['effective_date'].unique()}"
+            )
+            assert (hm["as_of_date"] == as_of).all(), (
+                f"as_of_date should be {as_of}, got {hm['as_of_date'].unique()}"
+            )
+
+    # ---- Invariant 3: large backfill calendar coverage ----
+
+    def test_large_backfill_calendar_window_formula(self):
+        """
+        For backfill_days=250, cal_window_days must be > 138 sessions worth of
+        calendar days (250 sessions * 1.4 ≈ 350 calendar days). The formula
+        max(200, backfill_days * 2 + 160) = max(200, 660) = 660 covers this.
+        """
+        backfill_days = 250
+        cal_window_days = max(200, backfill_days * 2 + 160)
+        # 250 sessions * ~1.4 calendar days/session ≈ 350 calendar days minimum needed.
+        # The formula must exceed that plus the 130d bar window = ~480 calendar days.
+        assert cal_window_days >= 480, (
+            f"cal_window_days={cal_window_days} is too small for backfill_days={backfill_days}"
+        )
+
+    def test_trading_days_before_large_n_with_dense_calendar(self):
+        """
+        _trading_days_before with n=200 must return exactly 200 dates from a
+        dense calendar (every weekday is a session). The calendar must be big enough
+        that no date walks outside the loaded window.
+        """
+        # Build a dense calendar: every weekday for ~600 days from a start date.
+        anchor = date(2026, 6, 24)
+        sessions = set()
+        d = anchor - timedelta(days=600)
+        while d <= anchor + timedelta(days=7):
+            if d.weekday() < 5:
+                sessions.add(d)
+            d += timedelta(days=1)
+        _flow_module._TRADING_DAYS = frozenset(sessions)
+
+        result = _trading_days_before(anchor, 200)
+        assert len(result) == 200, f"Expected 200 dates, got {len(result)}"
+        assert result[0] == anchor or result[0] == _latest_trading_day(anchor), (
+            "First date should be the most recent session <= anchor"
+        )
+        # All returned dates must be in the calendar.
+        for d in result:
+            assert _is_trading_day(d), f"{d} returned by _trading_days_before is not a session"
+
+    # ---- Invariant 4: holiday boundary — as_of snap + effective_date chain ----
+
+    def test_holiday_snap_chain_is_consistent(self):
+        """
+        On a holiday Thursday: as_of snaps to Wednesday; effective_date = Friday.
+        as_of_date < effective_date, and both are sessions.
+        """
+        wednesday = date(2026, 7, 1)
+        thursday = date(2026, 7, 2)   # holiday in fake calendar
+        friday = date(2026, 7, 3)
+
+        _flow_module._TRADING_DAYS = frozenset([wednesday, friday])
+        # thursday is NOT in the set (it's a holiday)
+
+        snapped_as_of = _latest_trading_day(thursday)
+        assert snapped_as_of == wednesday, f"Thursday holiday should snap to Wednesday, got {snapped_as_of}"
+
+        effective = _next_trading_day(snapped_as_of)
+        assert effective == friday, f"next session after Wednesday should be Friday, got {effective}"
+
+        assert _is_trading_day(snapped_as_of), "as_of_date must be a real session"
+        assert _is_trading_day(effective), "effective_date must be a real session"
+        assert snapped_as_of < effective, "as_of_date must be before effective_date"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

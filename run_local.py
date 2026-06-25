@@ -165,10 +165,12 @@ def run(
     # Determine raw as_of before loading the calendar so we cover the right window.
     raw_as_of = date.fromisoformat(as_of_override) if as_of_override else date.today()
 
-    # Load exchange calendar over the actual requested window (not hardcoded today ± window).
-    # This ensures historical backfills get correct holiday-aware sessions.
-    cal_start = raw_as_of - timedelta(days=200)
+    # Load exchange calendar over the actual requested window — sized for the backfill.
+    # backfill_days * 2 converts trading-days to calendar-days conservatively;
+    # + 130d bar-window buffer + 30d headroom. Minimum 200 calendar days.
     cal_end = raw_as_of + timedelta(days=7)
+    cal_window_days = max(200, backfill_days * 2 + 160)
+    cal_start = raw_as_of - timedelta(days=cal_window_days)
     print(f"  Loading NYSE calendar {cal_start} → {cal_end}...")
     _init_trading_calendar(cal_start, cal_end)
 
