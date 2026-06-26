@@ -1,0 +1,213 @@
+# Hedge Map ETL v2 — Heuristic Sector/Industry Crosswalk
+
+**Part A of MF Drift Hedge Overlay — selection redesign**
+**Date:** 2026-06-26
+**Status:** Implemented on `feat/hedge-map-heuristic`; local smoke run green.
+
+---
+
+## What changed (v1 → v2)
+
+v1 selected each stock's hedge by ranking **all 57 research ETFs by trailing-60d
+R²** and keeping the liquid+shortable top-3. That was noisy: the max-R² ETF for a
+given 60-day window is often a broad-market or unrelated fund that happened to
+correlate, and it churns window-to-window.
+
+v2 replaces max-R² with a **deterministic sector/industry → ETF crosswalk**:
+
+| rank | tier | ETF source |
+|---|---|---|
+| 1 | industry | pure-play industry ETF from the crosswalk (e.g. Semiconductors → SMH) |
+| 2 | sector | SPDR sector ETF (e.g. Technology → XLK) |
+| 3 | broad | SPY |
+
+Beta still **sizes** each short via the existing point-in-time
+`beta_r2_pair()` (trailing-60d OLS, `d <= as_of` inclusive, `MIN_N_OBS=60`), but
+now against the **assigned** ETF only — one regression per tier, not 57.
+
+The **output S3 path and row-per-rank schema are unchanged**, so the apex
+resolver contract is untouched. v2 only **adds** columns.
+
+---
+
+## Components
+
+| File | Role |
+|---|---|
+| `hedge_crosswalk.py` | The IP: `SECTOR_TO_ETF` (11 sectors, Tiingo + GICS variants), `INDUSTRY_TO_ETF` (~40 high-frequency Tiingo industries → pure-play ETFs), `classify()` ladder builder. No deps; import-safe. `CROSSWALK_VERSION = v2-heuristic-20260626`. |
+| `hedge_classification.py` | Loads the **latest** Tiingo `meta.json` partition (`date <= as_of`) from S3, keyed by upper-cased + SYMBOL_REMAP'd ticker. |
+| `hedge_selection.py` | `build_hedge_map()` — applies the crosswalk + the beta **quality gate** (demotion chain), emits the row-per-rank frame. `resolve_classification()` (Tiingo primary, SIC fallback). `R2_FLOOR = 0.05`. |
+| `hedge_map_flow.py` | Flow rewired to the heuristic path; fetches bars only for the ~30 crosswalk ETFs; extended manifest. |
+| `run_local.py` | Same, boto3-direct, with `--s3-prefix` for test runs. |
+| `discovery_classification.py` | Read-only discovery: meta vocabulary frequency table. |
+| `parity_heuristic.py` / `test_parity_heuristic.py` | Research-parity regression. |
+| `test_hedge_heuristic.py` | Unit tests (crosswalk, ladder, classification, fallback chain, schema). |
+
+---
+
+## Classification source: Tiingo `meta`
+
+- Primary fields: `sector`, `industry`.
+- Fallback: `sicSector` / `sicIndustry`, used **only when Tiingo `sector` is
+  null/blank**. We never mix a Tiingo sector with a SIC industry — the crosswalk
+  was tuned against same-source pairs. `classification_source` records
+  `tiingo` / `sic` / `none`.
+- Tiingo tickers are lowercase; we upper-case + apply `SYMBOL_REMAP` to align
+  with Alpaca-canonical symbols.
+
+### ⚠️ Coverage constraint (the key finding)
+
+The production `meta` partition currently covers only **~104 tickers** because
+the Tiingo fundamentals flow fetches meta for the curated `adhoc/tickers.txt`
+list — **not** the full ~13k Alpaca universe. So today, only ~104 of ~12k
+eligible stocks get a real classification; the rest are
+`classification_source="none"` and fall back to **SPY** at rank1.
+
+**This is a data-source-LIST limit, not a Tiingo subscription cap.** A probe of
+15 oracle tickers absent from the partition returned **15/15** full
+sector+industry from the live Tiingo meta endpoint. Remediation = broaden the
+meta fetch universe (a separate, low-risk change to the fundamentals flow /
+`tickers.txt`). The crosswalk already covers the industry strings those names
+return, so coverage lights up automatically once the meta universe grows — **no
+crosswalk change needed.**
+
+Coverage is fully **observable**: the manifest records counts/percentages of
+`pure_play` / `sector_fallback` / `spy_fallback` and `tiingo` / `sic` / `none`.
+
+---
+
+## Quality gate / fallback chain
+
+After the crosswalk assigns the rank1 (industry) ETF, we compute its beta/R².
+A tier **passes** iff:
+
+- `n_obs >= MIN_N_OBS (60)`,
+- `beta` finite and **non-negative**,
+- `r2` finite and `>= R2_FLOOR (0.05)`.
+
+If rank1 fails, we **demote** down the chain industry → sector → SPY and record
+the actual basis in `selection_basis` (`heuristic_industry` /
+`heuristic_sector` / `spy_fallback`). `industry_source` (`pure_play` /
+`sector_fallback`) reflects what the crosswalk *intended*, independent of the
+gate outcome. **Non-finite betas are never emitted.** If even SPY fails the gate
+(e.g. too little history), the stock gets **no rows** and falls through to the
+apex runtime's lower tiers — same as v1.
+
+This gate is what protects against Tiingo mis-classifications (e.g. Tiingo labels
+Unity `U` as "Airlines" → JETS; a bad JETS beta/R² demotes it).
+
+---
+
+## Output schema (frozen v1 columns + v2 additions)
+
+Path unchanged: `hedge_map/effective_date=YYYY-MM-DD/data.parquet`, 3 rows/ticker.
+
+v1 columns retained: `effective_date, as_of_date, ticker, rank, hedge_etf, beta,
+r2, n_obs, etf_shortable, etf_easy_to_borrow, etf_adv_usd_30d,
+stock_adv_usd_30d, selection_basis`.
+
+**Added in v2:**
+
+| column | values | meaning |
+|---|---|---|
+| `industry_source` | `pure_play` / `sector_fallback` | did the crosswalk find a pure-play for the industry |
+| `classification_sector` | str / null | sector string used |
+| `classification_industry` | str / null | industry string used |
+| `classification_source` | `tiingo` / `sic` / `none` | where the classification came from |
+
+`selection_basis` values change to `heuristic_industry` / `heuristic_sector` /
+`spy_fallback` (was `liquid_top_r2` in v1).
+
+Manifest adds: `crosswalk_version`, `classification_snapshot_date`,
+`crosswalk_coverage` (the coverage-stats block).
+
+---
+
+## Crosswalk rationale (curate-top-fallback-rest)
+
+- **Sector map (11):** every observed Tiingo sector string *and* the GICS names
+  the research oracle uses, so one map serves both production (raw Tiingo) and
+  the parity test (GICS). 100% match on the oracle's 135 GICS sectors.
+- **Industry map (~40):** curated for the highest-frequency Tiingo industries
+  that have a clean pure-play (semis→SMH, equipment→SOXX, software→IGV,
+  biotech→XBI, pharma→IBB, devices→IHI, regional banks→KRE, A&D→ITA,
+  airlines→JETS, rails/trucking→IYT, E&P→XOP, oil services→OIH, internet→FDN,
+  retail→XRT, homebuilders→XHB, solar→TAN). Niche/ambiguous industries are left
+  to the sector fallback rather than forced onto a loosely-related ETF. Every
+  industry ETF is in the research `etf_candidates.csv` set.
+
+---
+
+## Research parity (acceptance test #2)
+
+For the 135 oracle tickers in `ticker_classification.csv`:
+
+- **Sector parity (offline):** `crosswalk.sector_etf(gics_sector)` ==
+  `oracle.sector_etf` → **135/135 (100%)**.
+- **Industry parity on raw Tiingo (30-name overlap with the current meta
+  partition):** `crosswalk.classify(tiingo.sector, tiingo.industry).rank1_etf`
+  == `oracle.industry_etf` → **26/30 (86.7%)**, with the 4 divergences all
+  **documented** (gate = zero undocumented):
+
+| ticker | Tiingo sector / industry | oracle | mine | reason |
+|---|---|---|---|---|
+| ABNB | Industrials / Travel Services | XLY | XLI | Tiingo sector wrong (oracle GICS = Consumer Discretionary); both sector_fallback |
+| DASH | Communication Services / Internet Content & Information | ONLN | FDN | Tiingo sector wrong; FDN is the defensible map from the Tiingo input |
+| GEHC | Healthcare / Health Information Services | IHI | XLV | Tiingo industry too generic to know it's imaging devices |
+| SNPS | Technology / Software - Infrastructure | SOXX | IGV | EDA-vs-software is domain knowledge Tiingo's string doesn't encode |
+
+These are **intentional**: the production crosswalk maps raw Tiingo faithfully;
+the oracle injected company-specific GICS overrides. The beta quality gate is the
+backstop for the cases where the Tiingo input is simply wrong.
+
+---
+
+## Smoke run report (2026-06-26)
+
+```
+python run_local.py --as-of 2026-06-24 \
+  --subset AMD,MSFT,VRTX,EQT,TSLA,PYPL,NFLX,AAPL,AMZN,LRCX,XEL,COST,UNP,IDXX \
+  --s3-prefix hedge_map_test
+```
+
+Writes to the **test** prefix `s3://mh-guess-data/hedge_map_test/...` (never the
+prod `hedge_map` path). The parquet reads back with the full 17-column v2 schema.
+
+- effective_date 2026-06-25, as_of 2026-06-24
+- eligible 14/14, covered 13, rows 39
+- industry_source: pure_play 9 / sector_fallback 4 (69.2% pure-play)
+- selection_basis: heuristic_industry 8 / heuristic_sector 5 / spy_fallback 0
+- classification_source: tiingo 13 / sic 0 / none 0
+- ETF asset fetches: 30 crosswalk ETFs (was 57 in v1 — efficiency win)
+
+Spot-checks: AMD→SMH (β1.36, R²0.68), LRCX→SOXX (β1.06, R²0.82),
+MSFT→IGV (β0.74, R²0.69), EQT→XOP (β0.43), VRTX→XBI, IDXX→IHI, NFLX→FDN.
+Sector-fallback names (no curated industry pure-play) correctly collapse rank1
+to the sector ETF: PYPL/AAPL→XLK or XLF, TSLA→XLY, XEL→XLU — for these rank1 and
+rank2 are the same sector ETF (apex reads rank1; rank2/3 are diagnostics).
+
+### Worked example of the meta-coverage limit: UNP
+
+UNP (Union Pacific) was the one eligible name **dropped** (13 of 14). It is NOT
+in the curated meta partition → `classification_source="none"` → all three tiers
+collapse to SPY. UNP's trailing-60d SPY beta is ~0.004 with R²≈0.00, which fails
+`R2_FLOOR` → no usable hedge → the stock is omitted (it falls through to the apex
+runtime's lower tiers, same as v1). Yet UNP is a railroad and the crosswalk maps
+Railroads→IYT, against which UNP fits well (β0.60, R²0.26). So the moment the
+meta universe is broadened to include UNP, it would get a real IYT hedge with no
+crosswalk change. This is the clearest illustration of why the coverage fix is
+broadening the meta list — and why we drop rather than emit a meaningless SPY
+hedge with R²≈0.
+
+---
+
+## Design ambiguities resolved
+
+1. **Meta covers ~104, not the universe.** Resolved: classify what we can,
+   SPY-fallback the rest, report coverage in the manifest, and document that the
+   fix is broadening the meta list (probe-confirmed). No crosswalk change needed.
+2. **Oracle stores GICS + human-annotated industry, not raw Tiingo.** Resolved:
+   parity is two layers — sector on GICS (135/135), industry on raw Tiingo for
+   the overlap with documented divergences.
+3. **Tiingo taxonomy errors (U→Airlines, SNOW→Leisure).** Resolved: the rank1
+   beta/R² quality gate demotes a bad fit; we don't trust the label blindly.
