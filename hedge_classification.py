@@ -54,33 +54,84 @@ _NAME_NOISE = {
 }
 
 
-def _name_tokens(name: Optional[str]) -> set[str]:
-    """Normalize a company name to a set of significant lowercase tokens."""
+# Boilerplate phrases stripped as a UNIT before tokenizing (so "American" inside
+# the ADR phrase doesn't survive, while a real "American Express" is untouched).
+_BOILERPLATE_PHRASES = [
+    "american depositary shares", "american depositary receipts",
+    "american depositary share", "american depositary receipt",
+    "common stock", "ordinary shares", "ordinary share",
+    "class a subordinate voting shares", "subordinate voting shares",
+]
+
+
+def _name_token_list(name: Optional[str]) -> list[str]:
+    """Ordered significant lowercase tokens of a company name.
+
+    Apostrophes are intra-word (Bally's -> ballys, Kohl's -> kohls) so possessives
+    don't shatter into noise; ADR/boilerplate phrases are stripped as a unit; other
+    punctuation separates. Corporate/share-class noise tokens are removed.
+    """
     if not name:
-        return set()
-    cleaned = re.sub(r"[^a-z0-9 ]", " ", str(name).lower())
-    return {t for t in cleaned.split() if t and t not in _NAME_NOISE}
+        return []
+    lowered = str(name).lower().replace("'", "").replace("`", "").replace("’", "")
+    for phrase in _BOILERPLATE_PHRASES:
+        lowered = lowered.replace(phrase, " ")
+    cleaned = re.sub(r"[^a-z0-9 ]", " ", lowered)
+    return [t for t in cleaned.split() if t and t not in _NAME_NOISE]
+
+
+def _name_tokens(name: Optional[str]) -> set[str]:
+    """Significant lowercase tokens of a company name, as a set."""
+    return set(_name_token_list(name))
+
+
+def _name_squash(name: Optional[str]) -> str:
+    """Punctuation/space-free concatenation of significant tokens, in order.
+
+    'argenx SE' and 'Argen X SE' both squash to 'argenx'; 'Conoco Phillips' and
+    'ConocoPhillips' both to 'conocophillips'; 'Future Fuel' and 'Futurefuel' both
+    to 'futurefuel' — so spacing/concatenation variance no longer defeats
+    reconciliation. Order is PRESERVED (not sorted) so adjacency holds; single-
+    character tokens (entity-suffix fragments like the N / V of "N.V.") are dropped.
+    """
+    return "".join(t for t in _name_token_list(name) if len(t) > 1)
 
 
 def names_reconcile(tiingo_name: Optional[str], alpaca_name: Optional[str]) -> bool:
     """
     True if the Tiingo and Alpaca company names plausibly refer to the same firm.
 
-    Uses significant-token overlap after stripping corporate/share-class noise.
-    We require at least one shared significant token AND that the shorter token
-    set is mostly contained in the other (>= 50%), which tolerates Alpaca's
-    verbose names ("Unity Software Inc." vs Tiingo "Unity Software Inc") while
-    rejecting unrelated predecessors ("US Airways Group" vs "Unity Software").
+    Primary: significant-token overlap after stripping corporate/share-class noise
+    — at least one shared token AND the shorter token set >= 50% contained in the
+    other. This handles "Unity Software Inc." vs "Unity Software Inc" and the common
+    abbreviation case ("Greenbrier Companies"/"Greenbrier Cos", "CION Investment"/
+    "CION Invt"), and rejects "US Airways Group" vs "Unity Software".
+
+    Fallback (spacing/punctuation/possessive variance) — ONLY ADDITIVE, never
+    overrides a primary accept: compare the squashed (punctuation- and space-free,
+    order-preserving) significant-token strings. Accept when one is a prefix of the
+    other (>= 6 chars) or their character-similarity ratio is >= 0.90. Recovers
+    argenx/Argen X, Conoco Phillips/ConocoPhillips, Bally's/Ballys, SiriusXM/
+    Sirius XM, Future Fuel/Futurefuel, ConocoPhillips — variants the token check
+    misses because the brand is concatenated differently.
     """
     a = _name_tokens(tiingo_name)
     b = _name_tokens(alpaca_name)
     if not a or not b:
         return False
     overlap = a & b
-    if not overlap:
+    if overlap and len(overlap) / min(len(a), len(b)) >= 0.5:
+        return True
+
+    # Squashed-string fallback for spacing/concatenation/possessive variance.
+    sa, sb = _name_squash(tiingo_name), _name_squash(alpaca_name)
+    if len(sa) < 5 or len(sb) < 5:
         return False
-    shorter = min(len(a), len(b))
-    return len(overlap) / shorter >= 0.5
+    shorter, longer = (sa, sb) if len(sa) <= len(sb) else (sb, sa)
+    if len(shorter) >= 5 and longer.startswith(shorter):
+        return True
+    import difflib
+    return difflib.SequenceMatcher(None, sa, sb).ratio() >= 0.90
 
 
 # Outcome reasons returned alongside the chosen row, so the manifest can count
