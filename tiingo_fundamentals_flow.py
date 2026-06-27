@@ -50,21 +50,18 @@ def fetch_definitions(api_token: str) -> list:
 
 @task(retries=3, retry_delay_seconds=10)
 def fetch_meta(api_token: str, tickers: list) -> list:
-    """Fetch company metadata for all tickers in a single call."""
+    """
+    Fetch company metadata for `tickers`, BATCHED and concatenated.
+
+    The bulk meta endpoint is fine for ~100 tickers but a single GET fails for
+    the full tradable universe (URL length + payload). `fetch_meta_batched`
+    chunks to ~250 symbols/call with rate-limit headroom. Returns the
+    concatenated rows (may exceed len(tickers) when a symbol has been reused —
+    the hedge_map classification loader's active-row guard resolves that).
+    """
     logger = get_run_logger()
-    tickers_str = ",".join(tickers)
-    logger.info(f"Fetching fundamentals meta for {len(tickers)} tickers...")
-
-    response = requests.get(
-        f"{TIINGO_FUNDAMENTALS_BASE}/meta",
-        headers=_tiingo_headers(api_token),
-        params={'tickers': tickers_str},
-    )
-    response.raise_for_status()
-
-    data = response.json()
-    logger.info(f"Fetched meta for {len(data)} companies")
-    return data
+    from tiingo_meta_universe import fetch_meta_batched
+    return fetch_meta_batched(api_token, tickers, log=logger.info)
 
 
 @task(retries=3, retry_delay_seconds=10)
@@ -110,6 +107,36 @@ def fetch_statements(ticker: str, api_token: str, as_reported: bool) -> list:
     return data
 
 
+def _resolve_meta_universe(curated_tickers: list) -> list:
+    """
+    Resolve the ticker universe for the META partition: the full Alpaca tradable
+    us_equity universe, unioned with the curated list (so MF names are always
+    present even if Alpaca momentarily omits one).
+
+    Alpaca creds come from the same Prefect Secret blocks as the hedge_map flow,
+    with env-var fallback. If Alpaca is entirely unavailable we degrade to the
+    curated list rather than failing the meta partition.
+    """
+    logger = get_run_logger()
+    try:
+        from hedge_map_flow import _init_alpaca_creds, _alpaca_headers
+        from tiingo_meta_universe import fetch_tradable_equity_universe
+        _init_alpaca_creds(from_prefect_blocks=True)
+        universe = fetch_tradable_equity_universe(_alpaca_headers())
+        merged = list(dict.fromkeys(list(universe) + list(curated_tickers)))
+        logger.info(
+            f"Meta universe: {len(universe)} tradable us_equity + "
+            f"{len(curated_tickers)} curated = {len(merged)} unique"
+        )
+        return merged
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            f"Could not resolve full Alpaca universe ({exc}); "
+            f"falling back to curated {len(curated_tickers)}-ticker list for meta."
+        )
+        return list(curated_tickers)
+
+
 @flow(name="Tiingo Fundamentals Daily")
 def tiingo_fundamentals_flow():
     """
@@ -136,8 +163,12 @@ def tiingo_fundamentals_flow():
     )
     uploaded_keys.append(key)
 
-    # 2. Meta (single bulk call with all tickers)
-    meta = fetch_meta(api_token, tickers)
+    # 2. Meta — BROADENED to the full Alpaca tradable us_equity universe (batched).
+    #    The meta partition now classifies the whole universe (downstream hedge_map
+    #    reads it); the curated `tickers` list still drives the expensive per-ticker
+    #    daily/statements calls below.
+    meta_tickers = _resolve_meta_universe(tickers)
+    meta = fetch_meta(api_token, meta_tickers)
     key = upload_json_to_s3(
         meta,
         f"tiingo/json/fundamentals/meta/date={date_partition}/meta.json",
@@ -145,7 +176,7 @@ def tiingo_fundamentals_flow():
     )
     uploaded_keys.append(key)
 
-    # 3. Per-ticker: daily metrics + statements (both variants)
+    # 3. Per-ticker: daily metrics + statements (both variants) — curated list only.
     for ticker in tickers:
         daily_data = fetch_fundamentals_daily(ticker, api_token)
         key = upload_json_to_s3(

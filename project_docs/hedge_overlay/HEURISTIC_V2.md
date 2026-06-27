@@ -55,24 +55,64 @@ resolver contract is untouched. v2 only **adds** columns.
 - Tiingo tickers are lowercase; we upper-case + apply `SYMBOL_REMAP` to align
   with Alpaca-canonical symbols.
 
-### ⚠️ Coverage constraint (the key finding)
+### Universe broadening (round 2)
 
-The production `meta` partition currently covers only **~104 tickers** because
-the Tiingo fundamentals flow fetches meta for the curated `adhoc/tickers.txt`
-list — **not** the full ~13k Alpaca universe. So today, only ~104 of ~12k
-eligible stocks get a real classification; the rest are
-`classification_source="none"` and fall back to **SPY** at rank1.
+The Tiingo fundamentals flow's **meta** partition was widened from the curated
+~104-ticker `adhoc/tickers.txt` list to the **full Alpaca tradable us_equity
+universe** (`get_all_assets(status=active, tradable=true, asset_class=us_equity)`,
+~13k symbols). `tiingo_meta_universe.py` provides:
 
-**This is a data-source-LIST limit, not a Tiingo subscription cap.** A probe of
-15 oracle tickers absent from the partition returned **15/15** full
-sector+industry from the live Tiingo meta endpoint. Remediation = broaden the
-meta fetch universe (a separate, low-risk change to the fundamentals flow /
-`tickers.txt`). The crosswalk already covers the industry strings those names
-return, so coverage lights up automatically once the meta universe grows — **no
-crosswalk change needed.**
+- `fetch_tradable_equity_universe()` — the broadened ticker source.
+- `fetch_meta_batched()` — the Tiingo bulk `/fundamentals/meta?tickers=CSV`
+  endpoint **batched** (150/call) and concatenated. A single giant GET fails
+  (verified: 250/call returns 502; long URLs from suffixed symbols like
+  `FOO.PRK` / `BAR.WS`); a failing batch is **retried once at half size** before
+  its tickers are dropped (they fall through to SPY). 200/call is the empirical
+  ceiling; 150 is the default for headroom.
+
+`tiingo_fundamentals_flow.py` now drives the **meta** partition off the broadened
+universe (`_resolve_meta_universe` unions the Alpaca universe with the curated
+list, degrading to the curated list if Alpaca is unavailable). The expensive
+per-ticker daily/statements calls stay on the curated list. ETFs / non-equity
+that return no useful classification simply fall through to SPY.
+
+(This was a data-source-LIST limit, not a Tiingo subscription cap: a probe of 15
+oracle tickers absent from the old partition returned **15/15** full
+sector+industry from the live endpoint.)
 
 Coverage is fully **observable**: the manifest records counts/percentages of
 `pure_play` / `sector_fallback` / `spy_fallback` and `tiingo` / `sic` / `none`.
+
+### ⚠️ Ticker-reuse guard (round 2 — correctness-critical)
+
+The Tiingo bulk meta endpoint returns **multiple rows per ticker** when a symbol
+has been reused — the live company **and** delisted predecessors. Verified:
+
+| ticker | active row | delisted predecessor (isActive=False) |
+|---|---|---|
+| U | Unity Software Inc → Software-Application | **US AIRWAYS GROUP INC → Airlines** |
+| SNOW | Snowflake Inc → Software-Application | **Intrawest Resorts Holdings → Leisure** |
+
+A naive "last row wins" load can pick the **delisted** predecessor and assign a
+totally wrong industry (U → Airlines → JETS). `select_active_meta_row()` in
+`hedge_classification.py` runs **before the crosswalk**:
+
+1. Drop rows with `isActive != True`.
+2. Among active rows, prefer the one whose `name` **reconciles** with the live
+   Alpaca company name (`names_reconcile()` — significant-token overlap after
+   stripping corporate/share-class noise; tolerates "Unity Software Inc" vs
+   "Unity Software Inc." while rejecting "US Airways Group Inc").
+3. `isActive=False`-only, or an active row that doesn't reconcile →
+   **UNCLASSIFIED** (`classification_source="none"` → SPY). Never a wrong
+   industry. The rank1 beta/R² gate stays as defense-in-depth.
+
+Demonstrated end-to-end on a broadened test partition carrying both rows for U
+and SNOW: **U → IGV** and **SNOW → IGV** (Software-Application), not
+Airlines/Leisure. UNP — previously dropped to SPY because it was off the curated
+list — now classifies (Railroads → IYT). Full-subset coverage went 13/14 → 14/14
+with 13 pure_play / 1 sector_fallback / 0 none.
+
+See `docs/knowledge/tiingo_ticker_reuse.md` for the blast-radius analysis.
 
 ---
 

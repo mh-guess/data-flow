@@ -34,6 +34,10 @@ from hedge_selection import (
     resolve_classification,
 )
 from hedge_map_flow import MIN_N_OBS, compute_coverage_stats
+from hedge_classification import (
+    names_reconcile,
+    select_active_meta_row,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +381,184 @@ class TestCoverageStats:
         assert stats["selection_basis"]["spy_fallback"] == 1
         assert stats["classification_source"]["none"] == 1
         assert stats["coverage_pct_of_eligible"] == 30.0
+
+
+# ---------------------------------------------------------------------------
+# Ticker-reuse guard (isActive + name reconciliation)
+# ---------------------------------------------------------------------------
+
+# Real reuse cases verified against the live Tiingo meta endpoint.
+_U_ROWS = [
+    {"ticker": "u", "isActive": True, "name": "Unity Software Inc",
+     "sector": "Technology", "industry": "Software - Application"},
+    {"ticker": "u", "isActive": False, "name": "US AIRWAYS GROUP INC",
+     "sector": "Industrials", "industry": "Airlines"},
+]
+_SNOW_ROWS = [
+    {"ticker": "snow", "isActive": True, "name": "Snowflake Inc - Class A",
+     "sector": "Technology", "industry": "Software - Application"},
+    {"ticker": "snow", "isActive": False, "name": "Intrawest Resorts Holdings Inc",
+     "sector": "Consumer Cyclical", "industry": "Leisure"},
+]
+
+
+class TestNamesReconcile:
+    def test_same_company_minor_punctuation(self):
+        assert names_reconcile("Unity Software Inc", "Unity Software Inc.")
+        assert names_reconcile("Snowflake Inc - Class A", "Snowflake Inc.")
+        assert names_reconcile("Airbnb Inc - Class A", "Airbnb, Inc. Class A Common Stock")
+
+    def test_different_company_rejected(self):
+        assert not names_reconcile("US AIRWAYS GROUP INC", "Unity Software Inc.")
+        assert not names_reconcile("Intrawest Resorts Holdings Inc", "Snowflake Inc.")
+
+    def test_empty_names(self):
+        assert not names_reconcile(None, "Unity Software Inc.")
+        assert not names_reconcile("Unity", None)
+        assert not names_reconcile("", "")
+
+    def test_suffix_only_names_do_not_falsely_match(self):
+        # Two firms sharing only corporate noise tokens must NOT reconcile.
+        assert not names_reconcile("Holdings Inc", "Group Corp")
+
+
+class TestSelectActiveMetaRow:
+    def test_picks_active_over_delisted_with_name(self):
+        assert select_active_meta_row(_U_ROWS, "Unity Software Inc.")["name"] == "Unity Software Inc"
+        assert select_active_meta_row(_SNOW_ROWS, "Snowflake Inc.")["name"] == "Snowflake Inc - Class A"
+
+    def test_inactive_only_is_unclassified(self):
+        rows = [{"ticker": "x", "isActive": False, "name": "Dead Co",
+                 "sector": "Energy", "industry": "Oil & Gas E&P"}]
+        assert select_active_meta_row(rows, "Whatever Inc") is None
+
+    def test_active_but_name_mismatch_is_unclassified(self):
+        rows = [{"ticker": "y", "isActive": True, "name": "Totally Different Corp",
+                 "sector": "Energy", "industry": "Oil & Gas E&P"}]
+        assert select_active_meta_row(rows, "Unity Software Inc") is None
+
+    def test_single_active_no_name_anchor_is_trusted(self):
+        rows = [{"ticker": "z", "isActive": True, "name": "Some Co",
+                 "sector": "Technology", "industry": "Semiconductors"}]
+        assert select_active_meta_row(rows, None)["name"] == "Some Co"
+
+    def test_multiple_active_no_name_anchor_takes_most_recent(self):
+        rows = [
+            {"ticker": "z", "isActive": True, "name": "Old", "statementLastUpdated": "2020-01-01"},
+            {"ticker": "z", "isActive": True, "name": "New", "statementLastUpdated": "2026-01-01"},
+        ]
+        assert select_active_meta_row(rows, None)["name"] == "New"
+
+    def test_empty_rows(self):
+        assert select_active_meta_row([], "Anything") is None
+
+
+class TestLoadClassificationGuard:
+    """load_classification end-to-end with a stubbed S3 client."""
+
+    class _StubS3:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def get_paginator(self, _op):
+            class _P:
+                def paginate(self, **_kw):
+                    return [{"Contents": [
+                        {"Key": "tiingo/json/fundamentals/meta/date=2026-06-26/meta.json"}
+                    ]}]
+            return _P()
+
+        def get_object(self, **_kw):
+            import io as _io
+            import json as _json
+            return {"Body": _io.BytesIO(_json.dumps(self._rows).encode())}
+
+    def test_reused_ticker_resolves_to_active_company(self):
+        from hedge_classification import load_classification
+        s3 = self._StubS3(_U_ROWS + _SNOW_ROWS)
+        names = {"U": "Unity Software Inc.", "SNOW": "Snowflake Inc."}
+        lookup, snap = load_classification(s3, alpaca_names=names)
+        assert lookup["U"]["industry"] == "Software - Application"   # not Airlines
+        assert lookup["SNOW"]["industry"] == "Software - Application"  # not Leisure
+        assert snap == date(2026, 6, 26)
+
+    def test_reused_ticker_without_names_drops_ambiguous(self):
+        from hedge_classification import load_classification
+        s3 = self._StubS3(_U_ROWS)  # active Unity + inactive US Airways
+        lookup, _ = load_classification(s3, alpaca_names=None)
+        # Active row is unambiguous (only one active) → trusted even w/o name.
+        assert lookup["U"]["industry"] == "Software - Application"
+
+
+class TestMetaBatching:
+    def test_batches_and_concatenates(self, monkeypatch):
+        import tiingo_meta_universe as tmu
+        seen_batches = []
+
+        class _Resp:
+            status_code = 200
+
+            def __init__(self, payload):
+                self._p = payload
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return self._p
+
+        def _fake_get(url, headers=None, params=None, timeout=None):
+            syms = params["tickers"].split(",")
+            seen_batches.append(syms)
+            # echo one row per ticker
+            return _Resp([{"ticker": s, "isActive": True, "name": s} for s in syms])
+
+        monkeypatch.setattr(tmu.requests, "get", _fake_get)
+        tickers = [f"T{i}" for i in range(600)]
+        rows = tmu.fetch_meta_batched("tok", tickers, batch_size=250, sleep_s=0)
+        # 600 / 250 -> 3 batches; all tickers covered.
+        assert len(seen_batches) == 3
+        assert sum(len(b) for b in seen_batches) == 600
+        assert len(rows) == 600
+        # tickers were lower-cased for Tiingo.
+        assert seen_batches[0][0] == "t0"
+
+    def test_failed_batch_retries_by_splitting(self, monkeypatch):
+        # A batch that 502s on its FULL size but succeeds once split should
+        # recover via the half-size retry rather than dropping all its tickers.
+        import tiingo_meta_universe as tmu
+
+        class _Resp:
+            def __init__(self, payload):
+                self._p = payload
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return self._p
+
+        def _fake_get(url, headers=None, params=None, timeout=None):
+            syms = params["tickers"].split(",")
+            # Fail only when the batch is "too big" (> 200), like the real 502.
+            if len(syms) > 200:
+                raise RuntimeError("502 Bad Gateway")
+            return _Resp([{"ticker": s} for s in syms])
+
+        monkeypatch.setattr(tmu.requests, "get", _fake_get)
+        tickers = [f"T{i}" for i in range(250)]  # one 250 batch → fails → splits to 125+125
+        rows = tmu.fetch_meta_batched("tok", tickers, batch_size=250, sleep_s=0)
+        assert len(rows) == 250  # both halves recovered
+
+    def test_persistent_single_ticker_failure_is_dropped(self, monkeypatch):
+        import tiingo_meta_universe as tmu
+
+        def _fake_get(url, headers=None, params=None, timeout=None):
+            raise RuntimeError("always down")
+
+        monkeypatch.setattr(tmu.requests, "get", _fake_get)
+        rows = tmu.fetch_meta_batched("tok", ["A", "B"], batch_size=2, sleep_s=0)
+        assert rows == []  # split to singles, both fail, dropped (no crash)
 
 
 if __name__ == "__main__":

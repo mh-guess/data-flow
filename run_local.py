@@ -78,6 +78,7 @@ def fetch_universe_local() -> pd.DataFrame:
         sym = SYMBOL_REMAP.get(sym, sym)
         rows.append({
             "symbol": sym,
+            "name": a.get("name", ""),  # live company name, for meta name-reconciliation
             "shortable": bool(a.get("shortable", False)),
             "easy_to_borrow": bool(a.get("easy_to_borrow", False)),
         })
@@ -161,6 +162,7 @@ def run(
     subset_symbols: Optional[list[str]] = None,
     backfill_days: int = 0,
     s3_prefix: str = HEDGE_MAP_PREFIX,
+    meta_prefix: str = "tiingo/json/fundamentals/meta",
 ) -> list[dict]:
     """
     Local heuristic hedge-map run.
@@ -168,6 +170,7 @@ def run(
     s3_prefix: output prefix. Defaults to the prod `hedge_map` path; pass a TEST
     prefix (e.g. "hedge_map_test") for smoke runs so the prod partition is never
     touched.
+    meta_prefix: Tiingo meta partition prefix; override to read a test partition.
     """
     print("=" * 60)
     print("Hedge Map ETL (heuristic v2) — local run")
@@ -218,9 +221,18 @@ def run(
     # ETF metadata.
     etf_meta = build_etf_meta_local(universe)
 
+    # Live Alpaca company names — feed the ticker-reuse guard (reject delisted
+    # predecessors of reused tickers, e.g. U→US Airways, SNOW→Intrawest).
+    alpaca_names = {
+        str(row["symbol"]).upper(): row.get("name", "")
+        for _, row in universe.iterrows()
+    }
+
     # Classification (latest Tiingo meta partition from S3).
     try:
-        classification, class_snapshot_date = load_classification(s3, as_of=as_of_dates[0])
+        classification, class_snapshot_date = load_classification(
+            s3, as_of=as_of_dates[0], alpaca_names=alpaca_names, meta_prefix=meta_prefix
+        )
         print(f"  Classification: {len(classification)} tickers (snapshot {class_snapshot_date})")
     except FileNotFoundError as exc:
         print(f"  WARNING: no Tiingo meta partition ({exc}); all stocks → SPY fallback.")
@@ -358,9 +370,12 @@ if __name__ == "__main__":
     ap.add_argument("--backfill-days", dest="backfill_days", type=int, default=0)
     ap.add_argument("--s3-prefix", dest="s3_prefix", default=HEDGE_MAP_PREFIX,
                     help="Output S3 prefix (use a test prefix to avoid the prod hedge_map path)")
+    ap.add_argument("--meta-prefix", dest="meta_prefix", default="tiingo/json/fundamentals/meta",
+                    help="Tiingo meta partition prefix (override to read a test partition)")
     args = ap.parse_args()
 
     subset = [s.strip() for s in args.subset.split(",")] if args.subset else None
     results = run(as_of_override=args.as_of, subset_symbols=subset,
-                  backfill_days=args.backfill_days, s3_prefix=args.s3_prefix)
+                  backfill_days=args.backfill_days, s3_prefix=args.s3_prefix,
+                  meta_prefix=args.meta_prefix)
     print("\nFinal result:", json.dumps(results[-1] if results else {}, default=str, indent=2))

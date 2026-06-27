@@ -265,6 +265,7 @@ def fetch_universe() -> pd.DataFrame:
         sym = SYMBOL_REMAP.get(sym, sym)
         rows.append({
             "symbol": sym,
+            "name": a.get("name", ""),  # live company name, for meta name-reconciliation
             "shortable": bool(a.get("shortable", False)),
             "easy_to_borrow": bool(a.get("easy_to_borrow", False)),
         })
@@ -937,9 +938,18 @@ def hedge_map_flow(
     from hedge_classification import load_classification
     from hedge_selection import build_hedge_map as build_heuristic_hedge_map
 
+    # Live Alpaca company names — used by the ticker-reuse guard to reconcile a
+    # Tiingo meta record against the active company (rejects delisted predecessors).
+    alpaca_names = {
+        str(row["symbol"]).upper(): row.get("name", "")
+        for _, row in universe.iterrows()
+    }
+
     s3_client = aws_credentials.get_boto3_session().client("s3")
     try:
-        classification, class_snapshot_date = load_classification(s3_client, as_of=as_of_dates[0])
+        classification, class_snapshot_date = load_classification(
+            s3_client, as_of=as_of_dates[0], alpaca_names=alpaca_names
+        )
         logger.info(
             f"Loaded Tiingo classification: {len(classification)} tickers "
             f"(snapshot {class_snapshot_date})"
