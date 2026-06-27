@@ -281,3 +281,13 @@ hedge with R²≈0.
    the overlap with documented divergences.
 3. **Tiingo taxonomy errors (U→Airlines, SNOW→Leisure).** Resolved: the rank1
    beta/R² quality gate demotes a bad fit; we don't trust the label blindly.
+
+## Related docs
+
+- `docs/knowledge/tiingo_ticker_reuse.md` — the ticker-reuse / `isActive` guard
+  blast-radius study.
+- `project_docs/hedge_overlay/VALIDATION_2026-06-27.md` — broad-universe cutover
+  validation (full-13k classification + liquid/shortable hedge_map coverage).
+- `docs/knowledge/P1-etf-crosswalk-and-universe-reconciliation.md` — P1 backlog:
+  the longer-term universe + crosswalk reconciliation gap (new/retired ETF
+  discovery, versioned universe snapshots) this v2 plumbing sets up.
