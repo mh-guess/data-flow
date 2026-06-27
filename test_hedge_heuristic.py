@@ -437,6 +437,32 @@ class TestNamesReconcile:
         # Two firms sharing only corporate noise tokens must NOT reconcile.
         assert not names_reconcile("Holdings Inc", "Group Corp")
 
+    def test_spacing_punctuation_variants_reconcile(self):
+        # Same company, spacing/concatenation/possessive variance — must MATCH
+        # (false-negatives the additive squash fallback now recovers).
+        assert names_reconcile("Argen X SE", "argenx SE American Depositary Shares")
+        assert names_reconcile("Conoco Phillips", "ConocoPhillips")
+        assert names_reconcile("Ballys Corporation", "Bally's Corporation")
+        assert names_reconcile("Kohl`s Corp", "Kohls Corporation")
+        assert names_reconcile("Sirius XM Holdings Inc", "SiriusXM Holdings Inc.")
+        assert names_reconcile("Future Fuel Corporation", "Futurefuel Corp")
+        assert names_reconcile("Angiodynamic Inc", "AngioDynamics, Inc. Common Stock")
+
+    def test_abbreviation_variants_still_reconcile(self):
+        # The primary 50%-overlap rule (preserved) keeps the common
+        # Companies/Cos and Investment/Invt abbreviation matches.
+        assert names_reconcile("The Greenbrier Companies, Inc.", "Greenbrier Cos. Inc")
+        assert names_reconcile("CION Investment Corporation", "CION Invt Corp")
+        assert names_reconcile("Lowe's Companies Inc.", "Lowe`s Cos. Inc")
+
+    def test_adr_boilerplate_stripped_does_not_falsely_match(self):
+        # "American Depositary Shares" is stripped as a unit, so two different
+        # firms carrying that boilerplate do NOT reconcile on it.
+        assert not names_reconcile(
+            "Foo Mining American Depositary Shares",
+            "Bar Industries American Depositary Shares",
+        )
+
 
 class TestSelectActiveMetaRow:
     def test_picks_active_over_delisted_with_name(self):
