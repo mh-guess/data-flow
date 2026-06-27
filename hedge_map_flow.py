@@ -1,15 +1,25 @@
 """
-Nightly Hedge-Map ETL — Part A of MF Drift Hedge Overlay
+Nightly Hedge-Map ETL — Part A of MF Drift Hedge Overlay (v2: HEURISTIC)
 
 Produces a partitioned parquet on S3 that maps every eligible US equity ticker
-to its top-3 beta-weighted hedge ETFs (by R²) for the next trading session.
+to a 3-tier hedge ladder for the next trading session:
 
-S3 output (canonical path — the apex team needs this):
+  rank1 = industry pure-play ETF  (heuristic crosswalk; demoted on a bad beta)
+  rank2 = sector SPDR ETF
+  rank3 = SPY
+
+v2 replaces v1's max-R²-over-57-ETFs selection with a deterministic
+sector/industry → ETF crosswalk (`hedge_crosswalk.py`) driven by Tiingo `meta`
+classification. Beta still SIZES each short via `beta_r2_pair()` vs the assigned
+ETF (one regression per assigned ETF, not 57). See project_docs/hedge_overlay.
+
+S3 output (canonical path — the apex team needs this; UNCHANGED from v1):
   s3://mh-guess-data/hedge_map/effective_date=YYYY-MM-DD/data.parquet
   s3://mh-guess-data/hedge_map/manifests/effective_date=YYYY-MM-DD/manifest.json
 
 Sidecar manifest fields: effective_date, as_of_date, universe_size,
-  eligible_count, coverage_pct, etf_set_version, row_count.
+  eligible_count, coverage_pct, etf_set_version, crosswalk_version, row_count,
+  classification_snapshot_date, and crosswalk coverage stats.
 
 Run manually:
   python hedge_map_flow.py
@@ -39,6 +49,11 @@ from prefect import flow, get_run_logger, task
 from prefect.blocks.system import Secret
 from prefect_aws import AwsCredentials
 
+# hedge_crosswalk has no dependency on this module, so importing it at top level
+# is cycle-free. hedge_selection / hedge_classification DO import from this module,
+# so they are imported lazily inside the flow body to avoid a circular import.
+from hedge_crosswalk import CROSSWALK_VERSION, all_referenced_etfs
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -47,10 +62,12 @@ S3_BUCKET = "mh-guess-data"
 HEDGE_MAP_PREFIX = "hedge_map"
 UNIVERSE_SNAPSHOT_PREFIX = "hedge_map/universe_snapshots"
 
-# ETF candidate set version tag — bump when the research list changes.
+# ETF candidate set version tag — retained for the v1 max-R² helpers / parity test.
 ETF_SET_VERSION = "v1-57etf-20260624"
 
 # The research 57 ETFs (from etf_candidates.csv, in canonical order).
+# v2 no longer ranks across all of these per stock; the set is still used by the
+# v1 helpers (compute_hedge_map / parity_check.py) and to resolve ETF shortability.
 ETF_CANDIDATES: list[str] = [
     "SPY", "VOO", "VTI", "QQQ", "IWM", "MDY", "IWF", "IWD", "VUG", "MTUM", "RSP",
     "XLK", "XLF", "XLV", "XLY", "XLP", "XLE", "XLI", "XLB", "XLU", "XLRE", "XLC",
@@ -248,6 +265,7 @@ def fetch_universe() -> pd.DataFrame:
         sym = SYMBOL_REMAP.get(sym, sym)
         rows.append({
             "symbol": sym,
+            "name": a.get("name", ""),  # live company name, for meta name-reconciliation
             "shortable": bool(a.get("shortable", False)),
             "easy_to_borrow": bool(a.get("easy_to_borrow", False)),
         })
@@ -702,6 +720,12 @@ def write_hedge_map_to_s3(
     hm["etf_adv_usd_30d"] = hm["etf_adv_usd_30d"].astype(float)
     hm["stock_adv_usd_30d"] = hm["stock_adv_usd_30d"].astype(float)
     hm["selection_basis"] = hm["selection_basis"].astype(str)
+    # v2 classification columns. classification_sector/industry may be None for
+    # unclassified stocks — keep them as nullable object strings (no None→"None").
+    hm["industry_source"] = hm["industry_source"].astype(str)
+    hm["classification_sector"] = hm["classification_sector"].astype("string")
+    hm["classification_industry"] = hm["classification_industry"].astype("string")
+    hm["classification_source"] = hm["classification_source"].astype(str)
 
     buf = io.BytesIO()
     hm.to_parquet(buf, compression="snappy", index=False)
@@ -728,8 +752,10 @@ def write_run_manifest(
     covered_tickers: int,
     hedge_map_rows: int,
     aws_credentials: AwsCredentials,
+    classification_snapshot_date: Optional[date] = None,
+    coverage_stats: Optional[dict] = None,
 ) -> str:
-    """Write sidecar JSON manifest for this run."""
+    """Write sidecar JSON manifest for this run (v2: + classification + crosswalk stats)."""
     logger = get_run_logger()
 
     # coverage_pct = fraction of eligible tickers with at least one valid hedge (rank=1 row).
@@ -743,6 +769,12 @@ def write_run_manifest(
         "eligible_count": eligible_count,
         "coverage_pct": round(coverage_pct, 2),
         "etf_set_version": ETF_SET_VERSION,
+        "crosswalk_version": CROSSWALK_VERSION,
+        "classification_snapshot_date": (
+            classification_snapshot_date.isoformat()
+            if classification_snapshot_date else None
+        ),
+        "crosswalk_coverage": coverage_stats or {},
         "row_count": hedge_map_rows,
         "run_utc": datetime.now(timezone.utc).isoformat(),
     }
@@ -760,6 +792,83 @@ def write_run_manifest(
     logger.info(f"Manifest written: {uri}")
     logger.info(json.dumps(manifest, indent=2))
     return uri
+
+
+# ---------------------------------------------------------------------------
+# Coverage stats (v2)
+# ---------------------------------------------------------------------------
+
+def compute_coverage_stats(
+    hedge_map: pd.DataFrame,
+    eligible_count: int,
+    drop_reasons: Optional[dict] = None,
+    eligible_syms: Optional[list] = None,
+) -> dict:
+    """
+    Crosswalk coverage stats over the rank=1 rows (one per covered ticker).
+
+    Reports, over rank=1 rows:
+      industry_source     pure_play / sector_fallback
+      selection_basis     heuristic_industry / heuristic_sector / spy_fallback
+                          (spy_fallback = quality-gate beta fallback)
+      classification_source  tiingo / sic / no_meta / isactive_dropped / name_mismatch
+        — the last three are the DISTINCT ticker-reuse blast-radius buckets
+          (kept separate, never lumped into one 'none').
+
+    Plus `guard_drops` — the raw guard outcome over the ELIGIBLE universe
+    (independent of whether the stock got a hedge row), so the reuse hazard is
+    observable even for names that fell out on the SPY beta gate.
+    """
+    if hedge_map.empty:
+        base = {"covered_tickers": 0, "eligible_count": eligible_count}
+    else:
+        r1 = hedge_map[hedge_map["rank"] == 1]
+        covered = int(r1["ticker"].nunique())
+
+        def _pct(n: int) -> float:
+            return round(n / covered * 100.0, 2) if covered else 0.0
+
+        src_counts = r1["industry_source"].value_counts().to_dict()
+        basis_counts = r1["selection_basis"].value_counts().to_dict()
+        cls_counts = r1["classification_source"].value_counts().to_dict()
+
+        base = {
+            "covered_tickers": covered,
+            "eligible_count": eligible_count,
+            "coverage_pct_of_eligible": (
+                round(covered / eligible_count * 100.0, 2) if eligible_count else 0.0
+            ),
+            "industry_source": {
+                "pure_play": int(src_counts.get("pure_play", 0)),
+                "sector_fallback": int(src_counts.get("sector_fallback", 0)),
+                "pure_play_pct": _pct(int(src_counts.get("pure_play", 0))),
+            },
+            "selection_basis": {
+                "heuristic_industry": int(basis_counts.get("heuristic_industry", 0)),
+                "heuristic_sector": int(basis_counts.get("heuristic_sector", 0)),
+                "spy_fallback": int(basis_counts.get("spy_fallback", 0)),
+            },
+            "classification_source": {
+                "tiingo": int(cls_counts.get("tiingo", 0)),
+                "sic": int(cls_counts.get("sic", 0)),
+                "no_meta": int(cls_counts.get("no_meta", 0)),
+                "isactive_dropped": int(cls_counts.get("isactive_dropped", 0)),
+                "name_mismatch": int(cls_counts.get("name_mismatch", 0)),
+            },
+        }
+
+    # Raw guard blast radius over the eligible universe (independent of hedging).
+    drop_reasons = drop_reasons or {}
+    if eligible_syms is not None:
+        elig_set = {str(s).upper() for s in eligible_syms}
+        relevant = {t: r for t, r in drop_reasons.items() if t in elig_set}
+    else:
+        relevant = dict(drop_reasons)
+    base["guard_drops"] = {
+        "isactive_dropped": sum(1 for r in relevant.values() if r == "isactive_dropped"),
+        "name_mismatch": sum(1 for r in relevant.values() if r == "name_mismatch"),
+    }
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -850,9 +959,49 @@ def hedge_map_flow(
 
     persist_universe_snapshot(universe, as_of_dates[0], aws_credentials)
 
-    # Build ETF metadata dict (shortable/easy_to_borrow for each candidate ETF).
+    # --- Classification (Tiingo meta) ---
+    # Lazy import to avoid the hedge_selection/hedge_classification → hedge_map_flow cycle.
+    from hedge_classification import load_classification
+    from hedge_selection import build_hedge_map as build_heuristic_hedge_map
+
+    # Live Alpaca company names — used by the ticker-reuse guard to reconcile a
+    # Tiingo meta record against the active company (rejects delisted predecessors).
+    alpaca_names = {
+        str(row["symbol"]).upper(): row.get("name", "")
+        for _, row in universe.iterrows()
+    }
+
+    s3_client = aws_credentials.get_boto3_session().client("s3")
+    try:
+        classification, class_snapshot_date, drop_reasons = load_classification(
+            s3_client, as_of=as_of_dates[0], alpaca_names=alpaca_names
+        )
+        n_reuse = sum(1 for r in drop_reasons.values()
+                      if r in ("isactive_dropped", "name_mismatch"))
+        logger.info(
+            f"Loaded Tiingo classification: {len(classification)} tickers "
+            f"(snapshot {class_snapshot_date}); guard dropped {n_reuse} reused-ticker rows"
+        )
+    except FileNotFoundError as exc:
+        # No meta partition at all — degrade gracefully: every stock is
+        # classification_source='no_meta' and hedges to SPY. Coverage stats make
+        # this observable; we do NOT crash the nightly run over a missing meta.
+        logger.error(
+            f"No Tiingo meta partition found ({exc}); proceeding with empty "
+            "classification (all stocks → SPY fallback)."
+        )
+        classification, class_snapshot_date, drop_reasons = {}, None, {}
+
+    # The ETFs the heuristic crosswalk can emit (sector SPDRs + industry pure-plays + SPY).
+    # We still resolve shortability for the full ETF_CANDIDATES set so the v1 helpers
+    # and parity test keep working, but only the crosswalk ETFs need bars here.
+    crosswalk_etfs = sorted(all_referenced_etfs())
+
+    # Build ETF metadata dict (shortable/easy_to_borrow) for the crosswalk ETFs.
+    # v2 only emits crosswalk ETFs, so we only need shortability for those — no
+    # need to resolve all 57 v1 candidates (avoids ~27 extra individual fetches).
     # Start from the equity universe (ETFs are usually classified as us_equity on Alpaca).
-    etf_meta_rows = universe[universe["symbol"].isin(ETF_CANDIDATES)]
+    etf_meta_rows = universe[universe["symbol"].isin(crosswalk_etfs)]
     etf_meta: dict[str, dict] = {
         row["symbol"]: {"shortable": row["shortable"], "easy_to_borrow": row["easy_to_borrow"]}
         for _, row in etf_meta_rows.iterrows()
@@ -860,7 +1009,7 @@ def hedge_map_flow(
     # For any ETF not captured above, fetch its asset record individually so we don't
     # silently default it to non-shortable. Alpaca may classify some ETFs differently
     # (e.g., different asset_class) so they'd be absent from the us_equity universe.
-    missing_etfs = [e for e in ETF_CANDIDATES if e not in etf_meta]
+    missing_etfs = [e for e in crosswalk_etfs if e not in etf_meta]
     if missing_etfs:
         logger.info(f"Fetching asset records for {len(missing_etfs)} ETFs not in universe: {missing_etfs}")
     for etf in missing_etfs:
@@ -893,7 +1042,9 @@ def hedge_map_flow(
     bar_end = as_of_dates[0]           # inclusive: include the as_of close
     bar_start = earliest_as_of - timedelta(days=130)  # ~130 calendar days of buffer
 
-    all_symbols = list(universe["symbol"].tolist()) + ETF_CANDIDATES
+    # v2 only needs bars for the crosswalk ETFs (sector SPDRs + industry pure-plays
+    # + SPY), not all 57. Sentinel ETFs (SPY/QQQ/IWM) are added for the bar-lag guard.
+    all_symbols = list(universe["symbol"].tolist()) + crosswalk_etfs + _SENTINEL_ETFS
     all_symbols = list(dict.fromkeys(all_symbols))  # dedupe, preserve order
 
     logger.info(f"Fetching bars for {len(all_symbols)} symbols from {bar_start} to {bar_end}...")
@@ -927,13 +1078,19 @@ def hedge_map_flow(
         eligible_count = int(elig_df["eligible"].sum())
         logger.info(f"  Eligible: {eligible_count}/{len(universe)}")
 
-        hedge_map = compute_hedge_map(
-            elig_df, all_bars, etf_meta,
+        elig_syms = elig_df[elig_df["eligible"]]["symbol"].tolist()
+        hedge_map = build_heuristic_hedge_map(
+            elig_df, all_bars, etf_meta, classification,
             as_of=beta_as_of,
             effective_date=run_effective_date,
+            drop_reasons=drop_reasons,
         )
         covered = hedge_map[hedge_map["rank"] == 1]["ticker"].nunique()
+        cov_stats = compute_coverage_stats(
+            hedge_map, eligible_count, drop_reasons=drop_reasons, eligible_syms=elig_syms
+        )
         logger.info(f"  Covered tickers (rank=1): {covered}")
+        logger.info(f"  Coverage stats: {json.dumps(cov_stats)}")
 
         if not hedge_map.empty:
             s3_uri = write_hedge_map_to_s3(hedge_map, aws_credentials)
@@ -945,6 +1102,8 @@ def hedge_map_flow(
                 covered_tickers=covered,
                 hedge_map_rows=len(hedge_map),
                 aws_credentials=aws_credentials,
+                classification_snapshot_date=class_snapshot_date,
+                coverage_stats=cov_stats,
             )
             results.append({
                 "as_of": beta_as_of.isoformat(),
@@ -966,7 +1125,7 @@ def hedge_map_flow(
                 # Full-universe scheduled run: an empty map means data/metadata outage.
                 # Fail loudly so alerting fires — silently producing no hedge is worse.
                 raise RuntimeError(
-                    f"compute_hedge_map returned zero rows for as_of={run_as_of} "
+                    f"build_hedge_map returned zero rows for as_of={run_as_of} "
                     f"(eligible={eligible_count}). This indicates a data or metadata "
                     "outage; fix the root cause before the next run."
                 )

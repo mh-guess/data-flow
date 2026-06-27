@@ -1,0 +1,47 @@
+eff_sector,eff_industry,n_all,n_liquid
+Technology,Semiconductors,14,14
+Technology,Software - Application,11,11
+Technology,Software - Infrastructure,8,8
+Consumer Defensive,Beverages - Non-Alcoholic,4,4
+Healthcare,Drug Manufacturers - General,4,4
+Technology,Semiconductor Equipment & Materials,4,4
+Utilities,Utilities - Regulated Electric,4,4
+Communication Services,Internet Content & Information,3,3
+Communication Services,Telecom Services,3,3
+Consumer Cyclical,Internet Retail,3,3
+Industrials,Specialty Business Services,3,3
+Basic Materials,Specialty Chemicals,2,2
+Communication Services,Electronic Gaming & Multimedia,2,2
+Communication Services,Entertainment,2,2
+Consumer Cyclical,Apparel Retail,2,2
+Energy,Oil & Gas E&P,2,2
+Healthcare,Biotechnology,2,2
+Industrials,Staffing & Employment Services,2,2
+Industrials,Travel Services,2,2
+Technology,Electronic Components,2,2
+Technology,Information Technology Services,2,2
+Consumer Cyclical,Auto Manufacturers,1,1
+Consumer Cyclical,Lodging,1,1
+Consumer Cyclical,Restaurants,1,1
+Consumer Cyclical,Specialty Retail,1,1
+Consumer Defensive,Confectioners,1,1
+Consumer Defensive,Discount Stores,1,1
+Consumer Defensive,Food Distribution,1,1
+Consumer Defensive,Packaged Foods,1,1
+Energy,Oil & Gas Equipment & Services,1,1
+Financial Services,Credit Services,1,1
+Healthcare,Diagnostics & Research,1,1
+Healthcare,Health Information Services,1,1
+Healthcare,Medical Devices,1,1
+Healthcare,Medical Instruments & Supplies,1,1
+Industrials,Aerospace & Defense,1,1
+Industrials,Conglomerates,1,1
+Industrials,Consulting Services,1,1
+Industrials,Farm & Heavy Construction Machinery,1,1
+Industrials,Industrial Distribution,1,1
+Industrials,Railroads,1,1
+Industrials,Trucking,1,1
+Real Estate,Real Estate Services,1,1
+Technology,Communication Equipment,1,1
+Technology,Consumer Electronics,1,1
+Utilities,Utilities - Renewable,1,1
