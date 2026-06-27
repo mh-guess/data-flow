@@ -798,51 +798,77 @@ def write_run_manifest(
 # Coverage stats (v2)
 # ---------------------------------------------------------------------------
 
-def compute_coverage_stats(hedge_map: pd.DataFrame, eligible_count: int) -> dict:
+def compute_coverage_stats(
+    hedge_map: pd.DataFrame,
+    eligible_count: int,
+    drop_reasons: Optional[dict] = None,
+    eligible_syms: Optional[list] = None,
+) -> dict:
     """
     Crosswalk coverage stats over the rank=1 rows (one per covered ticker).
 
-    Returns counts/percentages of:
-      pure_play / sector_fallback (industry_source on rank1),
-      heuristic_industry / heuristic_sector / spy_fallback (selection_basis on rank1),
-      classification source (tiingo / sic / none),
-    plus the fraction of eligible tickers that got any hedge.
+    Reports, over rank=1 rows:
+      industry_source     pure_play / sector_fallback
+      selection_basis     heuristic_industry / heuristic_sector / spy_fallback
+                          (spy_fallback = quality-gate beta fallback)
+      classification_source  tiingo / sic / no_meta / isactive_dropped / name_mismatch
+        — the last three are the DISTINCT ticker-reuse blast-radius buckets
+          (kept separate, never lumped into one 'none').
+
+    Plus `guard_drops` — the raw guard outcome over the ELIGIBLE universe
+    (independent of whether the stock got a hedge row), so the reuse hazard is
+    observable even for names that fell out on the SPY beta gate.
     """
     if hedge_map.empty:
-        return {"covered_tickers": 0, "eligible_count": eligible_count}
+        base = {"covered_tickers": 0, "eligible_count": eligible_count}
+    else:
+        r1 = hedge_map[hedge_map["rank"] == 1]
+        covered = int(r1["ticker"].nunique())
 
-    r1 = hedge_map[hedge_map["rank"] == 1]
-    covered = int(r1["ticker"].nunique())
+        def _pct(n: int) -> float:
+            return round(n / covered * 100.0, 2) if covered else 0.0
 
-    def _pct(n: int) -> float:
-        return round(n / covered * 100.0, 2) if covered else 0.0
+        src_counts = r1["industry_source"].value_counts().to_dict()
+        basis_counts = r1["selection_basis"].value_counts().to_dict()
+        cls_counts = r1["classification_source"].value_counts().to_dict()
 
-    src_counts = r1["industry_source"].value_counts().to_dict()
-    basis_counts = r1["selection_basis"].value_counts().to_dict()
-    cls_counts = r1["classification_source"].value_counts().to_dict()
+        base = {
+            "covered_tickers": covered,
+            "eligible_count": eligible_count,
+            "coverage_pct_of_eligible": (
+                round(covered / eligible_count * 100.0, 2) if eligible_count else 0.0
+            ),
+            "industry_source": {
+                "pure_play": int(src_counts.get("pure_play", 0)),
+                "sector_fallback": int(src_counts.get("sector_fallback", 0)),
+                "pure_play_pct": _pct(int(src_counts.get("pure_play", 0))),
+            },
+            "selection_basis": {
+                "heuristic_industry": int(basis_counts.get("heuristic_industry", 0)),
+                "heuristic_sector": int(basis_counts.get("heuristic_sector", 0)),
+                "spy_fallback": int(basis_counts.get("spy_fallback", 0)),
+            },
+            "classification_source": {
+                "tiingo": int(cls_counts.get("tiingo", 0)),
+                "sic": int(cls_counts.get("sic", 0)),
+                "no_meta": int(cls_counts.get("no_meta", 0)),
+                "isactive_dropped": int(cls_counts.get("isactive_dropped", 0)),
+                "name_mismatch": int(cls_counts.get("name_mismatch", 0)),
+            },
+        }
 
-    return {
-        "covered_tickers": covered,
-        "eligible_count": eligible_count,
-        "coverage_pct_of_eligible": (
-            round(covered / eligible_count * 100.0, 2) if eligible_count else 0.0
-        ),
-        "industry_source": {
-            "pure_play": int(src_counts.get("pure_play", 0)),
-            "sector_fallback": int(src_counts.get("sector_fallback", 0)),
-            "pure_play_pct": _pct(int(src_counts.get("pure_play", 0))),
-        },
-        "selection_basis": {
-            "heuristic_industry": int(basis_counts.get("heuristic_industry", 0)),
-            "heuristic_sector": int(basis_counts.get("heuristic_sector", 0)),
-            "spy_fallback": int(basis_counts.get("spy_fallback", 0)),
-        },
-        "classification_source": {
-            "tiingo": int(cls_counts.get("tiingo", 0)),
-            "sic": int(cls_counts.get("sic", 0)),
-            "none": int(cls_counts.get("none", 0)),
-        },
+    # Raw guard blast radius over the eligible universe (independent of hedging).
+    drop_reasons = drop_reasons or {}
+    if eligible_syms is not None:
+        elig_set = {str(s).upper() for s in eligible_syms}
+        relevant = {t: r for t, r in drop_reasons.items() if t in elig_set}
+    else:
+        relevant = dict(drop_reasons)
+    base["guard_drops"] = {
+        "isactive_dropped": sum(1 for r in relevant.values() if r == "isactive_dropped"),
+        "name_mismatch": sum(1 for r in relevant.values() if r == "name_mismatch"),
     }
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -947,22 +973,24 @@ def hedge_map_flow(
 
     s3_client = aws_credentials.get_boto3_session().client("s3")
     try:
-        classification, class_snapshot_date = load_classification(
+        classification, class_snapshot_date, drop_reasons = load_classification(
             s3_client, as_of=as_of_dates[0], alpaca_names=alpaca_names
         )
+        n_reuse = sum(1 for r in drop_reasons.values()
+                      if r in ("isactive_dropped", "name_mismatch"))
         logger.info(
             f"Loaded Tiingo classification: {len(classification)} tickers "
-            f"(snapshot {class_snapshot_date})"
+            f"(snapshot {class_snapshot_date}); guard dropped {n_reuse} reused-ticker rows"
         )
     except FileNotFoundError as exc:
         # No meta partition at all — degrade gracefully: every stock is
-        # classification_source='none' and hedges to SPY. Coverage stats make
+        # classification_source='no_meta' and hedges to SPY. Coverage stats make
         # this observable; we do NOT crash the nightly run over a missing meta.
         logger.error(
             f"No Tiingo meta partition found ({exc}); proceeding with empty "
             "classification (all stocks → SPY fallback)."
         )
-        classification, class_snapshot_date = {}, None
+        classification, class_snapshot_date, drop_reasons = {}, None, {}
 
     # The ETFs the heuristic crosswalk can emit (sector SPDRs + industry pure-plays + SPY).
     # We still resolve shortability for the full ETF_CANDIDATES set so the v1 helpers
@@ -1050,13 +1078,17 @@ def hedge_map_flow(
         eligible_count = int(elig_df["eligible"].sum())
         logger.info(f"  Eligible: {eligible_count}/{len(universe)}")
 
+        elig_syms = elig_df[elig_df["eligible"]]["symbol"].tolist()
         hedge_map = build_heuristic_hedge_map(
             elig_df, all_bars, etf_meta, classification,
             as_of=beta_as_of,
             effective_date=run_effective_date,
+            drop_reasons=drop_reasons,
         )
         covered = hedge_map[hedge_map["rank"] == 1]["ticker"].nunique()
-        cov_stats = compute_coverage_stats(hedge_map, eligible_count)
+        cov_stats = compute_coverage_stats(
+            hedge_map, eligible_count, drop_reasons=drop_reasons, eligible_syms=elig_syms
+        )
         logger.info(f"  Covered tickers (rank=1): {covered}")
         logger.info(f"  Coverage stats: {json.dumps(cov_stats)}")
 

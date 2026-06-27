@@ -71,13 +71,19 @@ HEDGE_MAP_COLUMNS = [
 _BASIS_BY_RANK = {1: "heuristic_industry", 2: "heuristic_sector", 3: "spy_fallback"}
 
 
-def resolve_classification(meta_row: Optional[dict]) -> dict:
+def resolve_classification(meta_row: Optional[dict], unclassified_reason: str = "no_meta") -> dict:
     """
     Resolve (sector, industry, source) for one stock from a Tiingo meta row.
 
     Primary: Tiingo `sector` / `industry`.
     Fallback: `sicSector` / `sicIndustry` ONLY when Tiingo `sector` is null/blank.
-    Returns source='tiingo', 'sic', or 'none'.
+    Returns source='tiingo' / 'sic' when classified. When `meta_row` is None the
+    stock is UNCLASSIFIED and source = `unclassified_reason`, one of:
+      'no_meta'           — no meta row for the ticker
+      'isactive_dropped'  — only delisted (isActive=False) rows existed
+      'name_mismatch'     — active row existed but didn't reconcile (reused ticker)
+    These distinct buckets make the ticker-reuse blast radius observable in the
+    manifest (vs. lumping everything into a generic 'none').
 
     The sector and industry source are resolved together off the same primary
     field (Tiingo `sector` presence) so a row never mixes a Tiingo sector with
@@ -85,7 +91,7 @@ def resolve_classification(meta_row: Optional[dict]) -> dict:
     against.
     """
     if not meta_row:
-        return {"sector": None, "industry": None, "source": "none"}
+        return {"sector": None, "industry": None, "source": unclassified_reason}
 
     def _clean(v):
         if v is None:
@@ -106,7 +112,8 @@ def resolve_classification(meta_row: Optional[dict]) -> dict:
     if sic_sector:
         return {"sector": sic_sector, "industry": sic_industry, "source": "sic"}
 
-    return {"sector": None, "industry": None, "source": "none"}
+    # Row present but neither Tiingo nor SIC sector usable — treat as no usable meta.
+    return {"sector": None, "industry": None, "source": "no_meta"}
 
 
 def _safe_beta_r2(stock_ret: pd.DataFrame, etf_ret: Optional[pd.DataFrame], as_of: date):
@@ -135,6 +142,7 @@ def build_hedge_map(
     classification: dict[str, dict],
     as_of: date,
     effective_date: Optional[date] = None,
+    drop_reasons: Optional[dict[str, str]] = None,
 ) -> pd.DataFrame:
     """
     Build the heuristic hedge map (row-per-rank).
@@ -143,15 +151,20 @@ def build_hedge_map(
         eligible:  DataFrame from compute_eligibility (needs `symbol`, `eligible`).
         all_bars:  {symbol -> bars DataFrame} for stocks AND every crosswalk ETF.
         etf_meta:  {etf -> {shortable, easy_to_borrow}}.
-        classification: {TICKER_UPPER -> tiingo meta row dict}.
+        classification: {TICKER_UPPER -> chosen tiingo meta row dict}.
         as_of:     last close used for betas/ADV (inclusive).
         effective_date: session this partition is for (default next_trading_day).
+        drop_reasons: {TICKER_UPPER -> reason} for tickers the classification
+            loader dropped (isactive_dropped / name_mismatch); used so the
+            unclassified `classification_source` records the precise reason
+            instead of a generic 'none'. Absent ticker -> 'no_meta'.
 
     For every eligible stock we emit exactly 3 rows (rank1/2/3) when at least
     one tier passes the quality gate. rank1 = industry tier (possibly demoted to
     sector or SPY), rank2 = sector tier, rank3 = SPY. Non-finite betas are never
     emitted; a tier that fails the gate is replaced per the fallback chain.
     """
+    drop_reasons = drop_reasons or {}
     if effective_date is None:
         effective_date = _next_trading_day(as_of)
 
@@ -179,7 +192,11 @@ def build_hedge_map(
         sret = _compute_returns(sdf)
         stock_adv = compute_adv(sret, as_of)
 
-        cls = resolve_classification(classification.get(sym.upper()))
+        sym_up = sym.upper()
+        cls = resolve_classification(
+            classification.get(sym_up),
+            unclassified_reason=drop_reasons.get(sym_up, "no_meta"),
+        )
         ladder = classify(cls["sector"], cls["industry"])
 
         # ---- rank1: industry tier with quality-gate fallback chain ----

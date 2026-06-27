@@ -30,7 +30,6 @@ from hedge_map_flow import (
     S3_BUCKET,
     HEDGE_MAP_PREFIX,
     UNIVERSE_SNAPSHOT_PREFIX,
-    ETF_CANDIDATES,
     ETF_SET_VERSION,
     SYMBOL_REMAP,
     TOP_N_HEDGES,
@@ -230,13 +229,16 @@ def run(
 
     # Classification (latest Tiingo meta partition from S3).
     try:
-        classification, class_snapshot_date = load_classification(
+        classification, class_snapshot_date, drop_reasons = load_classification(
             s3, as_of=as_of_dates[0], alpaca_names=alpaca_names, meta_prefix=meta_prefix
         )
-        print(f"  Classification: {len(classification)} tickers (snapshot {class_snapshot_date})")
+        n_reuse = sum(1 for r in drop_reasons.values()
+                      if r in ("isactive_dropped", "name_mismatch"))
+        print(f"  Classification: {len(classification)} tickers (snapshot {class_snapshot_date}); "
+              f"guard dropped {n_reuse} reused-ticker rows")
     except FileNotFoundError as exc:
         print(f"  WARNING: no Tiingo meta partition ({exc}); all stocks → SPY fallback.")
-        classification, class_snapshot_date = {}, None
+        classification, class_snapshot_date, drop_reasons = {}, None, {}
 
     # Bars: fetch through as_of_dates[0] inclusive — as_of is the last close used in betas.
     earliest_as_of = as_of_dates[-1]
@@ -275,15 +277,19 @@ def run(
 
         elig_df = compute_eligibility(universe, all_bars, beta_as_of)
         eligible_count = int(elig_df["eligible"].sum())
+        elig_syms = elig_df[elig_df["eligible"]]["symbol"].tolist()
         print(f"  Eligible: {eligible_count}/{len(universe)}")
 
         hedge_map = build_heuristic_hedge_map(
             elig_df, all_bars, etf_meta, classification,
             as_of=beta_as_of,
             effective_date=run_effective_date,
+            drop_reasons=drop_reasons,
         )
         covered = hedge_map[hedge_map["rank"] == 1]["ticker"].nunique() if not hedge_map.empty else 0
-        cov_stats = compute_coverage_stats(hedge_map, eligible_count)
+        cov_stats = compute_coverage_stats(
+            hedge_map, eligible_count, drop_reasons=drop_reasons, eligible_syms=elig_syms
+        )
         print(f"  Covered tickers (rank=1): {covered}")
         print(f"  Coverage stats: {json.dumps(cov_stats)}")
 

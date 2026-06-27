@@ -83,36 +83,50 @@ def names_reconcile(tiingo_name: Optional[str], alpaca_name: Optional[str]) -> b
     return len(overlap) / shorter >= 0.5
 
 
+# Outcome reasons returned alongside the chosen row, so the manifest can count
+# the ticker-reuse blast radius as distinct buckets (not all lumped into 'none').
+REASON_OK = "ok"
+REASON_NO_META = "no_meta"               # ticker had no meta rows at all
+REASON_ISACTIVE_DROPPED = "isactive_dropped"  # only isActive=False rows present
+REASON_NAME_MISMATCH = "name_mismatch"   # active row(s) exist but none reconcile
+
+
 def select_active_meta_row(
     rows: list[dict], alpaca_name: Optional[str] = None
-) -> Optional[dict]:
+) -> tuple[Optional[dict], str]:
     """
     Pick the correct meta row for one ticker from possibly-many candidates.
 
-    Returns the chosen active+reconciled row, or None when the ticker should be
-    treated as UNCLASSIFIED (no active row, or ambiguity with no name match).
+    Returns (chosen_row, reason). chosen_row is None when the ticker should be
+    treated as UNCLASSIFIED; `reason` says WHY so the caller can count it:
+      REASON_OK               — a trustworthy active row was chosen
+      REASON_NO_META          — no rows for this ticker
+      REASON_ISACTIVE_DROPPED — only delisted (isActive=False) rows present
+      REASON_NAME_MISMATCH    — active row(s) exist but none reconcile with the
+                                live Alpaca company name (likely a reused ticker
+                                whose active row is a *different* listing)
     """
     if not rows:
-        return None
+        return None, REASON_NO_META
 
     active = [r for r in rows if r.get("isActive") is True]
     if not active:
-        return None  # only delisted predecessors -> unclassified
+        return None, REASON_ISACTIVE_DROPPED  # only delisted predecessors
 
     # If we know the live Alpaca name, prefer the active row that reconciles.
     if alpaca_name:
         reconciled = [r for r in active if names_reconcile(r.get("name"), alpaca_name)]
-        if len(reconciled) >= 1:
+        if reconciled:
             # If several reconcile (rare), the most-recently-updated wins.
-            return _most_recent(reconciled)
-        # No active row reconciles with the live company -> don't trust any.
-        return None
+            return _most_recent(reconciled), REASON_OK
+        # Active row(s) exist but none match the live company -> don't trust any.
+        return None, REASON_NAME_MISMATCH
 
     # No Alpaca name to reconcile against: only trust an unambiguous single
-    # active row. Multiple active rows without a name anchor -> unclassified.
+    # active row. Multiple active rows without a name anchor -> most-recent wins.
     if len(active) == 1:
-        return active[0]
-    return _most_recent(active)
+        return active[0], REASON_OK
+    return _most_recent(active), REASON_OK
 
 
 def _most_recent(rows: list[dict]) -> dict:
@@ -170,16 +184,21 @@ def load_classification(
     as_of: Optional[date] = None,
     alpaca_names: Optional[dict[str, str]] = None,
     meta_prefix: str = META_PREFIX,
-) -> tuple[dict[str, dict], Optional[date]]:
+) -> tuple[dict[str, dict], Optional[date], dict[str, str]]:
     """
-    Load the latest meta partition and return ({TICKER_UPPER -> row}, partition_date).
+    Load the latest meta partition.
+
+    Returns ({TICKER_UPPER -> chosen_row}, partition_date, drop_reasons), where
+    drop_reasons maps {TICKER_UPPER -> REASON_*} for tickers that HAD meta rows
+    but were dropped by the guard (REASON_ISACTIVE_DROPPED / REASON_NAME_MISMATCH).
+    Tickers with no meta rows at all are simply absent from both maps (the caller
+    treats absence as REASON_NO_META).
 
     Rows are grouped by upper-cased + SYMBOL_REMAP-normalized ticker, then the
     ticker-reuse guard (`select_active_meta_row`) picks the single trustworthy
-    active row per ticker (or drops the ticker -> unclassified). Pass
-    `alpaca_names` ({TICKER_UPPER -> company_name}) to enable name reconciliation;
-    without it, only unambiguous single-active-row tickers are trusted.
-    `meta_prefix` lets smoke tests point at a test partition.
+    active row per ticker. Pass `alpaca_names` ({TICKER_UPPER -> company_name}) to
+    enable name reconciliation; without it, only unambiguous single-active-row
+    tickers are trusted. `meta_prefix` lets smoke tests point at a test partition.
     """
     key = latest_meta_partition_key(s3_client, as_of, meta_prefix)
     obj = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
@@ -197,9 +216,12 @@ def load_classification(
 
     names = alpaca_names or {}
     lookup: dict[str, dict] = {}
+    drop_reasons: dict[str, str] = {}
     for sym, rows in grouped.items():
-        chosen = select_active_meta_row(rows, names.get(sym))
+        chosen, reason = select_active_meta_row(rows, names.get(sym))
         if chosen is not None:
             lookup[sym] = chosen
+        else:
+            drop_reasons[sym] = reason
 
-    return lookup, partition_date_from_key(key)
+    return lookup, partition_date_from_key(key), drop_reasons

@@ -103,14 +103,32 @@ totally wrong industry (U → Airlines → JETS). `select_active_meta_row()` in
    stripping corporate/share-class noise; tolerates "Unity Software Inc" vs
    "Unity Software Inc." while rejecting "US Airways Group Inc").
 3. `isActive=False`-only, or an active row that doesn't reconcile →
-   **UNCLASSIFIED** (`classification_source="none"` → SPY). Never a wrong
-   industry. The rank1 beta/R² gate stays as defense-in-depth.
+   **UNCLASSIFIED** (→ SPY). Never a wrong industry. The rank1 beta/R² gate
+   stays as defense-in-depth.
+
+**The guard RECOVERS the correct classification whenever a live active row
+exists** — it does not merely fall back to SPY. Because the bulk endpoint
+returns *both* the active company and the delisted predecessor, the guard keeps
+the **active** row and the stock gets its proper industry/sector ETF (U → IGV,
+SNOW → IGV). It only falls to SPY when **no** active row exists for the symbol
+(`isActive=False`-only → `isactive_dropped`) or the sole active row doesn't match
+the live company (`name_mismatch`). So the net effect is a *better* outcome than
+the prior behavior — correct ETF, not SPY — for every reused ticker whose live
+listing is present in the meta.
+
+Each unclassified outcome is a **distinct, separately-counted bucket** (never
+lumped into one generic 'none'), so the reuse blast radius is observable nightly:
+`classification_source ∈ {tiingo, sic, no_meta, isactive_dropped, name_mismatch}`,
+plus a `guard_drops` block in the manifest that counts `isactive_dropped` /
+`name_mismatch` over the **eligible universe** (so the hazard is visible even for
+names that then fall out on the SPY beta gate). Spikes in these counters are
+alertable.
 
 Demonstrated end-to-end on a broadened test partition carrying both rows for U
 and SNOW: **U → IGV** and **SNOW → IGV** (Software-Application), not
 Airlines/Leisure. UNP — previously dropped to SPY because it was off the curated
-list — now classifies (Railroads → IYT). Full-subset coverage went 13/14 → 14/14
-with 13 pure_play / 1 sector_fallback / 0 none.
+list — now classifies (Railroads → IYT). A synthetic `isActive=False`-only AAPL
+row is correctly counted as `isactive_dropped` (→ SPY), not silently mapped.
 
 See `docs/knowledge/tiingo_ticker_reuse.md` for the blast-radius analysis.
 
@@ -153,13 +171,16 @@ stock_adv_usd_30d, selection_basis`.
 | `industry_source` | `pure_play` / `sector_fallback` | did the crosswalk find a pure-play for the industry |
 | `classification_sector` | str / null | sector string used |
 | `classification_industry` | str / null | industry string used |
-| `classification_source` | `tiingo` / `sic` / `none` | where the classification came from |
+| `classification_source` | `tiingo` / `sic` / `no_meta` / `isactive_dropped` / `name_mismatch` | classification provenance; the last three are the distinct ticker-reuse unclassified buckets |
 
 `selection_basis` values change to `heuristic_industry` / `heuristic_sector` /
 `spy_fallback` (was `liquid_top_r2` in v1).
 
-Manifest adds: `crosswalk_version`, `classification_snapshot_date`,
-`crosswalk_coverage` (the coverage-stats block).
+Manifest adds: `crosswalk_version`, `classification_snapshot_date`, and the
+`crosswalk_coverage` block, which now reports the classification buckets
+separately (`tiingo` / `sic` / `no_meta` / `isactive_dropped` / `name_mismatch`)
+plus a `guard_drops` sub-block counting `isactive_dropped` / `name_mismatch` over
+the eligible universe (the nightly ticker-reuse blast radius; alertable).
 
 ---
 

@@ -201,10 +201,14 @@ class TestResolveClassification:
         assert r["source"] == "sic"
         assert r["sector"] == "Services"
 
-    def test_none_when_no_classification(self):
-        assert resolve_classification(None)["source"] == "none"
-        assert resolve_classification({})["source"] == "none"
-        assert resolve_classification({"sector": "", "sicSector": ""})["source"] == "none"
+    def test_unclassified_reason_is_threaded(self):
+        # No meta row → the provided unclassified_reason becomes the source.
+        assert resolve_classification(None)["source"] == "no_meta"
+        assert resolve_classification(None, "isactive_dropped")["source"] == "isactive_dropped"
+        assert resolve_classification(None, "name_mismatch")["source"] == "name_mismatch"
+        # Empty dict → no usable meta.
+        assert resolve_classification({})["source"] == "no_meta"
+        assert resolve_classification({"sector": "", "sicSector": ""})["source"] == "no_meta"
 
     def test_tiingo_sector_present_industry_null_keeps_tiingo(self):
         # If Tiingo sector exists but industry is null, we stay on Tiingo (industry None)
@@ -279,11 +283,11 @@ class TestBuildHedgeMap:
         spy, spy_rets = _make_etf(self.END, seed=31)
         stock = _make_stock_corr(spy_rets, self.END, beta=1.0, noise=0.002, seed=32)
         df = self._scenario(stock, {"SPY": spy}, {}, sym="UNKNOWNCO")
-        # No classification → source none → rank1 falls to SPY.
+        # No meta row → source 'no_meta' → rank1 falls to SPY.
         assert not df.empty
         r1 = df[df["rank"] == 1].iloc[0]
         assert r1["hedge_etf"] == "SPY"
-        assert r1["classification_source"] == "none"
+        assert r1["classification_source"] == "no_meta"
         assert r1["selection_basis"] == "spy_fallback"
 
     def test_schema_columns_and_rank_ordering(self):
@@ -364,23 +368,35 @@ class TestSicFallbackClassification(object):
 
 class TestCoverageStats:
     def test_coverage_stats_shape(self):
-        # Build a tiny hedge map by hand.
+        # Build a tiny hedge map by hand exercising the distinct unclassified
+        # buckets (no_meta / isactive_dropped / name_mismatch).
         rows = []
         for sym, src, basis, cls in [
             ("A", "pure_play", "heuristic_industry", "tiingo"),
             ("B", "sector_fallback", "heuristic_sector", "tiingo"),
-            ("C", "sector_fallback", "spy_fallback", "none"),
+            ("C", "sector_fallback", "spy_fallback", "no_meta"),
+            ("D", "sector_fallback", "spy_fallback", "isactive_dropped"),
+            ("E", "sector_fallback", "spy_fallback", "name_mismatch"),
         ]:
             rows.append({"rank": 1, "ticker": sym, "industry_source": src,
                          "selection_basis": basis, "classification_source": cls})
         hm = pd.DataFrame(rows)
-        stats = compute_coverage_stats(hm, eligible_count=10)
-        assert stats["covered_tickers"] == 3
+        stats = compute_coverage_stats(
+            hm, eligible_count=10,
+            drop_reasons={"D": "isactive_dropped", "E": "name_mismatch", "Z": "isactive_dropped"},
+            eligible_syms=["A", "B", "C", "D", "E"],  # Z not eligible → excluded from guard_drops
+        )
+        assert stats["covered_tickers"] == 5
         assert stats["industry_source"]["pure_play"] == 1
-        assert stats["industry_source"]["sector_fallback"] == 2
-        assert stats["selection_basis"]["spy_fallback"] == 1
-        assert stats["classification_source"]["none"] == 1
-        assert stats["coverage_pct_of_eligible"] == 30.0
+        assert stats["industry_source"]["sector_fallback"] == 4
+        assert stats["selection_basis"]["spy_fallback"] == 3
+        assert stats["classification_source"]["no_meta"] == 1
+        assert stats["classification_source"]["isactive_dropped"] == 1
+        assert stats["classification_source"]["name_mismatch"] == 1
+        # guard_drops counts over the ELIGIBLE universe only (Z excluded).
+        assert stats["guard_drops"]["isactive_dropped"] == 1
+        assert stats["guard_drops"]["name_mismatch"] == 1
+        assert stats["coverage_pct_of_eligible"] == 50.0
 
 
 # ---------------------------------------------------------------------------
@@ -424,33 +440,40 @@ class TestNamesReconcile:
 
 class TestSelectActiveMetaRow:
     def test_picks_active_over_delisted_with_name(self):
-        assert select_active_meta_row(_U_ROWS, "Unity Software Inc.")["name"] == "Unity Software Inc"
-        assert select_active_meta_row(_SNOW_ROWS, "Snowflake Inc.")["name"] == "Snowflake Inc - Class A"
+        row, reason = select_active_meta_row(_U_ROWS, "Unity Software Inc.")
+        assert row["name"] == "Unity Software Inc" and reason == "ok"
+        row, reason = select_active_meta_row(_SNOW_ROWS, "Snowflake Inc.")
+        assert row["name"] == "Snowflake Inc - Class A" and reason == "ok"
 
-    def test_inactive_only_is_unclassified(self):
+    def test_inactive_only_is_isactive_dropped(self):
         rows = [{"ticker": "x", "isActive": False, "name": "Dead Co",
                  "sector": "Energy", "industry": "Oil & Gas E&P"}]
-        assert select_active_meta_row(rows, "Whatever Inc") is None
+        row, reason = select_active_meta_row(rows, "Whatever Inc")
+        assert row is None and reason == "isactive_dropped"
 
-    def test_active_but_name_mismatch_is_unclassified(self):
+    def test_active_but_name_mismatch(self):
         rows = [{"ticker": "y", "isActive": True, "name": "Totally Different Corp",
                  "sector": "Energy", "industry": "Oil & Gas E&P"}]
-        assert select_active_meta_row(rows, "Unity Software Inc") is None
+        row, reason = select_active_meta_row(rows, "Unity Software Inc")
+        assert row is None and reason == "name_mismatch"
 
     def test_single_active_no_name_anchor_is_trusted(self):
         rows = [{"ticker": "z", "isActive": True, "name": "Some Co",
                  "sector": "Technology", "industry": "Semiconductors"}]
-        assert select_active_meta_row(rows, None)["name"] == "Some Co"
+        row, reason = select_active_meta_row(rows, None)
+        assert row["name"] == "Some Co" and reason == "ok"
 
     def test_multiple_active_no_name_anchor_takes_most_recent(self):
         rows = [
             {"ticker": "z", "isActive": True, "name": "Old", "statementLastUpdated": "2020-01-01"},
             {"ticker": "z", "isActive": True, "name": "New", "statementLastUpdated": "2026-01-01"},
         ]
-        assert select_active_meta_row(rows, None)["name"] == "New"
+        row, reason = select_active_meta_row(rows, None)
+        assert row["name"] == "New" and reason == "ok"
 
-    def test_empty_rows(self):
-        assert select_active_meta_row([], "Anything") is None
+    def test_empty_rows_is_no_meta(self):
+        row, reason = select_active_meta_row([], "Anything")
+        assert row is None and reason == "no_meta"
 
 
 class TestLoadClassificationGuard:
@@ -477,17 +500,27 @@ class TestLoadClassificationGuard:
         from hedge_classification import load_classification
         s3 = self._StubS3(_U_ROWS + _SNOW_ROWS)
         names = {"U": "Unity Software Inc.", "SNOW": "Snowflake Inc."}
-        lookup, snap = load_classification(s3, alpaca_names=names)
+        lookup, snap, drops = load_classification(s3, alpaca_names=names)
         assert lookup["U"]["industry"] == "Software - Application"   # not Airlines
         assert lookup["SNOW"]["industry"] == "Software - Application"  # not Leisure
         assert snap == date(2026, 6, 26)
+        assert drops == {}  # both resolved cleanly
 
     def test_reused_ticker_without_names_drops_ambiguous(self):
         from hedge_classification import load_classification
         s3 = self._StubS3(_U_ROWS)  # active Unity + inactive US Airways
-        lookup, _ = load_classification(s3, alpaca_names=None)
+        lookup, _, drops = load_classification(s3, alpaca_names=None)
         # Active row is unambiguous (only one active) → trusted even w/o name.
         assert lookup["U"]["industry"] == "Software - Application"
+        assert drops == {}
+
+    def test_name_mismatch_recorded_in_drop_reasons(self):
+        from hedge_classification import load_classification
+        # U's active row is Unity, but we feed a wrong Alpaca name → name_mismatch.
+        s3 = self._StubS3(_U_ROWS)
+        lookup, _, drops = load_classification(s3, alpaca_names={"U": "Some Other Company"})
+        assert "U" not in lookup
+        assert drops["U"] == "name_mismatch"
 
 
 class TestMetaBatching:
