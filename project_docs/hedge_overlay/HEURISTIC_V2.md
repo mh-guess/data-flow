@@ -130,7 +130,16 @@ Airlines/Leisure. UNP — previously dropped to SPY because it was off the curat
 list — now classifies (Railroads → IYT). A synthetic `isActive=False`-only AAPL
 row is correctly counted as `isactive_dropped` (→ SPY), not silently mapped.
 
-See `docs/knowledge/tiingo_ticker_reuse.md` for the blast-radius analysis.
+**Blast radius (research scan, full Alpaca tradable us_equity, N=13,123):**
+**2.39% (313)** tickers are naive-wrong collisions (the bare-ticker pick is a
+delisted predecessor), of which **100 (31.9%)** would be *confidently wrong*
+pure-play hedges pre-guard. The `isActive=True` filter **recovers 100% of the
+313** — the live twin is always present in the meta — so the net effect is a
+*better* outcome (correct ETF) for every one. The only irreducible residual is
+**0.82% (108)** all-inactive tickers (the live issuer is absent from Tiingo
+entirely) → SPY + warn. Within our own 135-name MF study set, **6** were
+collisions (3 confidently wrong: U→JETS, PATH→XBI, CART→KRE) — all caught by the
+guard. Full analysis: `docs/knowledge/tiingo_ticker_reuse.md`.
 
 ---
 

@@ -22,6 +22,7 @@ the hedge_map flow.
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Callable, Optional
 
@@ -31,6 +32,23 @@ from hedge_map_flow import SYMBOL_REMAP
 
 ALPACA_ASSETS_URL = "https://api.alpaca.markets/v2/assets"
 TIINGO_META_URL = "https://api.tiingo.com/tiingo/fundamentals/meta"
+
+# SECURITY: this client authenticates via the Authorization HEADER, so the token
+# is never placed in the request URL. As defense-in-depth, redact any token that
+# could still surface in an exception message (e.g. if an upstream caller ever
+# passes a ?token= URL, or a Tiingo error body echoes one) before logging.
+_TOKEN_PATTERNS = [
+    re.compile(r"(?i)(token=)[^&\s\"']+"),       # ?token=SECRET query param
+    re.compile(r"(?i)(Token\s+)[A-Za-z0-9._\-]+"),  # "Token SECRET" header value
+]
+
+
+def _redact(text: object) -> str:
+    """Scrub any API token from a string before it is logged."""
+    s = str(text)
+    for pat in _TOKEN_PATTERNS:
+        s = pat.sub(r"\1<redacted>", s)
+    return s
 
 # Tiingo meta batching. Empirically 200/call still 200-OKs but 250 returns 502s
 # (long URLs from suffixed symbols like FOO.PRK / BAR.WS). 150 is a safe default
@@ -119,11 +137,12 @@ def _fetch_one_batch(
         resp.raise_for_status()
         return resp.json()
     except Exception as exc:  # noqa: BLE001
+        # Redact any token before logging — never let a URL/error body leak it.
         if len(batch) <= 1:
-            log(f"  meta single-ticker batch {batch} FAILED ({exc}); skipping")
+            log(f"  meta single-ticker batch {batch} FAILED ({_redact(exc)}); skipping")
             return []
         mid = len(batch) // 2
-        log(f"  meta batch of {len(batch)} FAILED ({exc}); retrying as 2 halves")
+        log(f"  meta batch of {len(batch)} FAILED ({_redact(exc)}); retrying as 2 halves")
         time.sleep(sleep_s)
         left = _fetch_one_batch(batch[:mid], headers, sleep_s, log)
         time.sleep(sleep_s)

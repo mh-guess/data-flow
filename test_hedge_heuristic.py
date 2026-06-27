@@ -522,6 +522,33 @@ class TestLoadClassificationGuard:
         assert "U" not in lookup
         assert drops["U"] == "name_mismatch"
 
+    def test_recovered_collision_is_not_counted_as_a_drop(self):
+        # CRITICAL semantics: when a dead row is dropped but the LIVE row is
+        # recovered, the ticker classifies normally and must NOT appear in
+        # drop_reasons (the guard_drops counters reflect true residual, not
+        # recoveries).
+        from hedge_classification import load_classification
+        s3 = self._StubS3(_U_ROWS + _SNOW_ROWS)
+        names = {"U": "Unity Software Inc.", "SNOW": "Snowflake Inc."}
+        lookup, _, drops = load_classification(s3, alpaca_names=names)
+        assert "U" in lookup and "SNOW" in lookup
+        assert "U" not in drops and "SNOW" not in drops
+        assert drops == {}  # both reused tickers recovered → zero residual
+
+
+class TestTokenRedaction:
+    def test_redacts_query_param_and_header_forms(self):
+        from tiingo_meta_universe import _redact
+        out = _redact("GET https://api.tiingo.com/x?token=SECRETabc123&foo=1")
+        assert "SECRETabc123" not in out and "token=<redacted>" in out
+        out2 = _redact("Authorization: Token SECRETabc123")
+        assert "SECRETabc123" not in out2 and "<redacted>" in out2
+
+    def test_redaction_preserves_non_token_text(self):
+        from tiingo_meta_universe import _redact
+        assert _redact("502 Bad Gateway for tickers=aapl,msft") == \
+            "502 Bad Gateway for tickers=aapl,msft"
+
 
 class TestMetaBatching:
     def test_batches_and_concatenates(self, monkeypatch):
