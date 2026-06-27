@@ -122,10 +122,89 @@ original 50%-token-overlap primary rule — which handles abbreviations like
 
 No blocking anomalies. Numbers are ready for the PM's step-4 decision on apex #34.
 
+---
+
+## Production go-live run (2026-06-27)
+
+After PR #1/#3 merged to main (HEAD 5d9fcb3), the broadened meta + hedge_map were
+run against the **REAL prod S3 paths** (PM-authorized; executed in the main
+session with the user approving each prod-write prompt — destructive prod writes
+require direct-user intent, not teammate authorization). apex untouched.
+
+### ⚠️ Weekend date-misalignment (manual-run edge case — NOT a pipeline bug)
+
+The first manual attempt wrote broad meta to `date=2026-06-27` (the calendar
+Saturday) but ran the hedge_map flow with `--as-of 2026-06-26` (the snapped
+Friday trading day). `latest_meta_partition_key` selects the newest partition with
+`date <= as_of`, so the flow read the **old narrow `date=2026-06-26`** partition
+and skipped the broad `06-27` one as "future" — yielding a manifest with only
+~92 tiingo-classified names (the old curated list), not the broad universe.
+
+**Root cause:** a manual run wrote the meta partition to a date AHEAD of the
+snapped `as_of`. **This does not occur in scheduled prod:** the nightly flow runs
+post-close on a trading weekday, so the meta partition date equals the `as_of`
+trading day and `date <= as_of` resolves to that same-day broad partition —
+aligned by construction.
+
+**Corrective action (run, backup-first):** wrote broad meta ALSO to
+`date=2026-06-26` (`prod_broaden_meta.py --date 2026-06-26 --prod`, with the
+narrow `06-26` partition backed up first), then re-ran `run_local.py
+--as-of 2026-06-26` → it read the broad meta and wrote a correct hedge_map for
+`effective_date=2026-06-29`.
+
+**Operational guard (this PR):** `prod_broaden_meta.py` now **defaults `--date` to
+the latest TRADING day** (calendar-aware snap), not calendar today — so a manual
+cutover/backfill writes meta to the same date the flow will snap `as_of` to,
+closing the footgun. Explicit `--date` still overrides.
+
+### Prod manifest — corrected run (VERIFIED PASS)
+
+`run_local.py` applies **no $25M ADV liquid screen**, so its covered set is a
+SUPERSET of the liquid-subset validation above — its covered-ticker count
+(8,776) far exceeds the 2,149 liquid figure, as expected. The per-bucket
+proportions and the spot-checks are the comparison.
+
+**Prod meta partition** (date=2026-06-26, post-broaden; also written to 06-27):
+3,944,666 bytes, 6,351 rows, 5,774 active tickers. Narrow predecessors backed up
+to `…/meta/_backups/date=2026-06-26/` and `…/date=2026-06-27/meta_pre-broaden.json`.
+
+**hedge_map** (`effective_date=2026-06-29`, as_of 2026-06-26):
+
+| metric | value |
+|---|--:|
+| universe | 13,123 |
+| eligible | 12,143 |
+| covered | 8,776 (72.27% of eligible) |
+| hedge_map_rows | 26,328 (3/ticker) |
+| classification_source | tiingo 3,689 / sic 0 / no_meta 4,910 / isactive_dropped 79 / name_mismatch 98 (within covered) |
+| industry_source | pure_play 1,908 (21.74%) / sector_fallback 6,868 |
+| selection_basis | heuristic_industry 1,697 / heuristic_sector 1,667 / spy_fallback 5,412 |
+| guard_drops (over eligible) | isactive_dropped 104 / name_mismatch 214 |
+
+Reading: of the 8,776 covered, **3,364 get a real sector/industry ETF**; the rest
+hedge to SPY — dominated by the `no_meta` obscure tail (4,910) we would never
+trade. `guard_drops.isactive_dropped` (104) ≈ the research blast-radius residual
+(~0.82% of the universe). `effective_date=2026-06-29` is the correct map for
+Monday's session (Friday-close betas); Monday's scheduled run continues the
+cadence normally.
+
+**Spot-checks (prod parquet, independently confirmed):** U→IGV, SNOW→IGV,
+PATH→IGV, CART→FDN (all RECOVERED from delisted predecessors), NVDA→SMH, JPM→KBE,
+XOM→XLE, LLY→IBB. Full v2 17-column schema present. ✅
+
+**Verdict: PASS.** Prod coverage, guard residual, and spot-checks all consistent
+with the validated test-run; the one weekend manual-run anomaly was root-caused
+(date alignment, not a pipeline bug), corrected, and guarded against.
+
 ### Commands
 ```
+# validation (test prefix; scratchpad harnesses)
 python step2_broad_meta.py        # broad meta → test prefix
 python step3_validate.py          # scope A + scope B + spot-checks
+
+# prod cutover (manual; --prod interlock; --date defaults to latest trading day)
+python prod_broaden_meta.py --prod --backup-first        # broaden prod meta
+python run_local.py --as-of 2026-06-26                   # prod hedge_map (real paths)
 ```
 (Scripts kept in the session scratchpad as ephemeral validation harnesses; the
 durable record is this doc. Test S3 prefixes were cleaned up after the run.)
