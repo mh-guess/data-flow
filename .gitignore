@@ -47,3 +47,6 @@ data/
 *.csv
 *.json
 *.parquet
+
+# Exception: bundled test fixtures committed to the repo
+!tests/fixtures/*.csv

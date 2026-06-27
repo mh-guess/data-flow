@@ -17,3 +17,6 @@ requests>=2.31.0
 pandas>=2.0.0
 pyarrow>=14.0.0
 ruamel.yaml>=0.18.0
+
+# Hedge-map ETL: numpy OLS regression (corrcoef/cov/var) for beta/R² computation.
+numpy>=1.26.0
