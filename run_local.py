@@ -332,8 +332,10 @@ def run(
         parquet_uri = write_to_s3_local(s3, parquet_key, parquet_bytes, "application/x-parquet")
         print(f"  Parquet written: {parquet_uri}")
 
-        # Stable latest/ copy — only for the newest effective_date (backfill-safe).
-        publish_latest = (effective_date == max_effective_date)
+        # Stable latest/ copy — only for the newest effective_date of a FULL run.
+        # Subset smoke runs must never overwrite latest/ (a 21-row subset would
+        # corrupt the consumer-facing stable address until the next nightly run).
+        publish_latest = (effective_date == max_effective_date) and not subset_symbols
         if publish_latest:
             latest_parquet_key = _latest_key(parquet_key)
             write_to_s3_local(s3, latest_parquet_key, parquet_bytes, "application/x-parquet")

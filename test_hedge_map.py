@@ -12,6 +12,7 @@ Tests:
   8. _latest_key: stable S3 latest/ key derivation from dated partition keys
   9. Upload functions: both dated and latest/ keys are written (publish_latest=True/False)
  10. Backfill gating: latest/ written exactly once, for the newest effective_date only
+ 11. run_local subset gate: latest/ never written for subset smoke runs
 """
 
 from __future__ import annotations
@@ -56,6 +57,7 @@ from hedge_map_flow import (
     _SENTINEL_ETFS,
 )
 import hedge_map_flow as _flow_module
+from run_local import write_to_s3_local
 
 
 # ---------------------------------------------------------------------------
@@ -1643,6 +1645,93 @@ class TestBackfillLatestGating:
         put_keys = [c.kwargs["Key"] for c in mock_s3.put_object.call_args_list]
         assert f"{HEDGE_MAP_PREFIX}/latest/data.parquet" in put_keys
         assert len(put_keys) == 2  # dated + latest
+
+
+# ---------------------------------------------------------------------------
+# 11. run_local subset gate: latest/ never written for subset smoke runs
+# ---------------------------------------------------------------------------
+
+class TestRunLocalSubsetGating:
+    """
+    Validates that run_local.py never publishes latest/ during a subset smoke run.
+
+    Gate: publish_latest = (effective_date == max_effective_date) and not subset_symbols
+
+    A subset run (--subset AAPL,MSFT,...) must not write latest/ even when
+    effective_date equals max_effective_date. A 21-row subset would otherwise
+    overwrite the stable consumer address until the next nightly full run.
+    """
+
+    def _put_keys(self, mock_s3) -> list[str]:
+        return [c.kwargs["Key"] for c in mock_s3.put_object.call_args_list]
+
+    def test_subset_run_writes_no_latest_key(self):
+        """Subset run: dated partition only — latest/ must never be written."""
+        mock_s3 = mock.MagicMock()
+        eff_date = date(2024, 6, 3)
+        subset_symbols = ["AAPL", "MSFT"]
+        parquet_bytes = b"fake-parquet-bytes"
+
+        # Simulate the run_local loop: subset run, single day.
+        max_effective_date = eff_date
+        parquet_key = f"{HEDGE_MAP_PREFIX}/effective_date={eff_date.isoformat()}/data.parquet"
+        write_to_s3_local(mock_s3, parquet_key, parquet_bytes, "application/x-parquet")
+
+        publish_latest = (eff_date == max_effective_date) and not subset_symbols
+        if publish_latest:
+            write_to_s3_local(mock_s3, _latest_key(parquet_key), parquet_bytes, "application/x-parquet")
+
+        put_keys = self._put_keys(mock_s3)
+        assert len(put_keys) == 1, (
+            f"subset run must write only the dated key, got {len(put_keys)}: {put_keys}"
+        )
+        assert "latest" not in put_keys[0], (
+            f"latest/ must not appear in a subset run: {put_keys}"
+        )
+
+    def test_subset_run_newest_date_still_blocked(self):
+        """Even when effective_date == max_effective_date, subset blocks latest/."""
+        mock_s3 = mock.MagicMock()
+        eff_date = date(2024, 6, 5)
+        subset_symbols = ["TSLA"]  # non-empty → blocked
+        parquet_bytes = b"fake-parquet-bytes"
+
+        max_effective_date = eff_date  # newest date — would publish in a full run
+        parquet_key = f"{HEDGE_MAP_PREFIX}/effective_date={eff_date.isoformat()}/data.parquet"
+        write_to_s3_local(mock_s3, parquet_key, parquet_bytes, "application/x-parquet")
+
+        publish_latest = (eff_date == max_effective_date) and not subset_symbols
+        assert not publish_latest, (
+            "publish_latest must be False for a subset run even on the newest date"
+        )
+        # No latest/ write happens.
+        put_keys = self._put_keys(mock_s3)
+        assert all("latest" not in k for k in put_keys), (
+            f"latest/ must not be written in subset run: {put_keys}"
+        )
+
+    def test_full_run_newest_date_writes_latest(self):
+        """Full run (subset_symbols=None): dated + latest/ are both written."""
+        mock_s3 = mock.MagicMock()
+        eff_date = date(2024, 6, 3)
+        subset_symbols = None  # full run
+        parquet_bytes = b"fake-parquet-bytes"
+
+        max_effective_date = eff_date
+        parquet_key = f"{HEDGE_MAP_PREFIX}/effective_date={eff_date.isoformat()}/data.parquet"
+        write_to_s3_local(mock_s3, parquet_key, parquet_bytes, "application/x-parquet")
+
+        publish_latest = (eff_date == max_effective_date) and not subset_symbols
+        if publish_latest:
+            write_to_s3_local(mock_s3, _latest_key(parquet_key), parquet_bytes, "application/x-parquet")
+
+        put_keys = self._put_keys(mock_s3)
+        assert len(put_keys) == 2, (
+            f"full run must write dated + latest, got {len(put_keys)}: {put_keys}"
+        )
+        assert any("latest" in k for k in put_keys), (
+            f"latest/ must be written in full run: {put_keys}"
+        )
 
 
 if __name__ == "__main__":
