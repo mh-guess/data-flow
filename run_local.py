@@ -264,6 +264,10 @@ def run(
         print(f"  WARNING: bar availability guard fired; beta_as_of adjusted for "
               f"{len(beta_as_of_overrides)} date(s). See log for details.")
 
+    # Only the newest effective_date should overwrite latest/. Compute the max
+    # upfront so the gate is robust to any future ordering change in as_of_dates.
+    max_effective_date = max(_next_trading_day(d) for d in as_of_dates)
+
     # Process each as_of date.
     results: list[dict] = []
     for run_as_of in as_of_dates:
@@ -328,10 +332,12 @@ def run(
         parquet_uri = write_to_s3_local(s3, parquet_key, parquet_bytes, "application/x-parquet")
         print(f"  Parquet written: {parquet_uri}")
 
-        # Stable latest/ copy — byte-identical re-put (mirrors write_hedge_map_to_s3).
-        latest_parquet_key = _latest_key(parquet_key)
-        write_to_s3_local(s3, latest_parquet_key, parquet_bytes, "application/x-parquet")
-        print(f"  Parquet latest:  s3://{S3_BUCKET}/{latest_parquet_key}")
+        # Stable latest/ copy — only for the newest effective_date (backfill-safe).
+        publish_latest = (effective_date == max_effective_date)
+        if publish_latest:
+            latest_parquet_key = _latest_key(parquet_key)
+            write_to_s3_local(s3, latest_parquet_key, parquet_bytes, "application/x-parquet")
+            print(f"  Parquet latest:  s3://{S3_BUCKET}/{latest_parquet_key}")
 
         # Write manifest.
         # Use beta_as_of (the actual last close used for betas/ADV) — not run_as_of —
@@ -357,12 +363,13 @@ def run(
         write_to_s3_local(s3, manifest_key, manifest_bytes, "application/json")
         print(f"  Manifest written: s3://{S3_BUCKET}/{manifest_key}")
 
-        # Stable latest/ copy — byte-identical re-put (mirrors write_run_manifest).
-        latest_manifest_key = _latest_key(manifest_key)
-        write_to_s3_local(s3, latest_manifest_key, manifest_bytes, "application/json")
-        print(f"  Manifest latest:  s3://{S3_BUCKET}/{latest_manifest_key}")
+        # Stable latest/ copy — only for the newest effective_date (backfill-safe).
+        if publish_latest:
+            latest_manifest_key = _latest_key(manifest_key)
+            write_to_s3_local(s3, latest_manifest_key, manifest_bytes, "application/json")
+            print(f"  Manifest latest:  s3://{S3_BUCKET}/{latest_manifest_key}")
 
-        results.append({
+        result: dict = {
             "as_of": run_as_of.isoformat(),
             "effective_date": effective_date.isoformat(),
             "universe_size": len(universe),
@@ -372,9 +379,11 @@ def run(
             "coverage_pct": coverage_pct,
             "s3_uri": parquet_uri,
             "manifest_uri": f"s3://{S3_BUCKET}/{manifest_key}",
-            "latest_s3_uri": f"s3://{S3_BUCKET}/{latest_parquet_key}",
-            "latest_manifest_uri": f"s3://{S3_BUCKET}/{latest_manifest_key}",
-        })
+        }
+        if publish_latest:
+            result["latest_s3_uri"] = f"s3://{S3_BUCKET}/{latest_parquet_key}"
+            result["latest_manifest_uri"] = f"s3://{S3_BUCKET}/{latest_manifest_key}"
+        results.append(result)
 
     print("\n" + "=" * 60)
     print("Completed. Results:")

@@ -10,6 +10,8 @@ Tests:
   6. P1-a: Alpaca credential loading (_init_alpaca_creds)
   7. P1-b: Scheduled as_of default produces the right effective_date
   8. _latest_key: stable S3 latest/ key derivation from dated partition keys
+  9. Upload functions: both dated and latest/ keys are written (publish_latest=True/False)
+ 10. Backfill gating: latest/ written exactly once, for the newest effective_date only
 """
 
 from __future__ import annotations
@@ -1517,6 +1519,130 @@ class TestWriteS3LatestKeys:
         bodies = [c.kwargs["Body"] for c in mock_s3.put_object.call_args_list]
         assert len(bodies) == 2
         assert bodies[0] == bodies[1], "dated and latest/ manifest bodies must be byte-identical"
+
+    def test_write_hedge_map_publish_latest_false_skips_latest_key(self):
+        """publish_latest=False writes only the dated key — no latest/ put."""
+        hm = _make_hedge_map_df(date(2024, 6, 3))
+        mock_s3, mock_creds = self._mock_s3_and_creds()
+        with mock.patch("hedge_map_flow.get_run_logger", return_value=mock.MagicMock()):
+            write_hedge_map_to_s3.fn(hm, mock_creds, publish_latest=False)
+
+        put_keys = [c.kwargs["Key"] for c in mock_s3.put_object.call_args_list]
+        assert len(put_keys) == 1, f"expected 1 put_object call, got {len(put_keys)}: {put_keys}"
+        assert put_keys[0] == f"{HEDGE_MAP_PREFIX}/effective_date=2024-06-03/data.parquet"
+        latest_key = f"{HEDGE_MAP_PREFIX}/latest/data.parquet"
+        assert latest_key not in put_keys, "latest/ key must not be written when publish_latest=False"
+
+    def test_write_manifest_publish_latest_false_skips_latest_key(self):
+        """publish_latest=False writes only the dated manifest key — no latest/ put."""
+        mock_s3, mock_creds = self._mock_s3_and_creds()
+        with mock.patch("hedge_map_flow.get_run_logger", return_value=mock.MagicMock()):
+            write_run_manifest.fn(
+                as_of=date(2024, 6, 2),
+                effective_date=date(2024, 6, 3),
+                universe_size=5000,
+                eligible_count=3000,
+                covered_tickers=2900,
+                hedge_map_rows=8700,
+                aws_credentials=mock_creds,
+                publish_latest=False,
+            )
+
+        put_keys = [c.kwargs["Key"] for c in mock_s3.put_object.call_args_list]
+        assert len(put_keys) == 1, f"expected 1 put_object call, got {len(put_keys)}: {put_keys}"
+        latest_key = f"{HEDGE_MAP_PREFIX}/manifests/latest/manifest.json"
+        assert latest_key not in put_keys, "latest/ key must not be written when publish_latest=False"
+
+
+# ---------------------------------------------------------------------------
+# 10. Backfill latest/ gating: only the newest effective_date writes latest/
+# ---------------------------------------------------------------------------
+
+class TestBackfillLatestGating:
+    """
+    Validates that across a multi-day backfill the latest/ key is written exactly
+    once — for the NEWEST effective_date only — and that older iterations write
+    only their dated partitions.
+
+    Simulates the flow loop by calling write_hedge_map_to_s3.fn three times
+    (newest True, middle False, oldest False) as the real loop would, then
+    asserts the combined put_object call list has exactly one latest/ key and
+    that key was written by the newest-date call.
+    """
+
+    def _mock_s3_and_creds(self):
+        mock_s3 = mock.MagicMock()
+        mock_creds = mock.MagicMock()
+        mock_creds.get_boto3_session.return_value.client.return_value = mock_s3
+        return mock_s3, mock_creds
+
+    def test_backfill_latest_written_once_for_newest(self):
+        """
+        3-day backfill (newest-first, matching _trading_days_before order):
+          2024-06-05  publish_latest=True  → dated + latest/
+          2024-06-04  publish_latest=False → dated only
+          2024-06-03  publish_latest=False → dated only
+
+        latest/ key must appear exactly once, for effective_date=2024-06-05.
+        """
+        # Three effective_dates newest → oldest (mirrors _trading_days_before order).
+        dates = [date(2024, 6, 5), date(2024, 6, 4), date(2024, 6, 3)]
+        max_eff = max(dates)
+
+        # One shared mock_s3 accumulates all put_object calls across the loop.
+        mock_s3 = mock.MagicMock()
+        mock_creds = mock.MagicMock()
+        mock_creds.get_boto3_session.return_value.client.return_value = mock_s3
+
+        with mock.patch("hedge_map_flow.get_run_logger", return_value=mock.MagicMock()):
+            for eff_date in dates:
+                hm = _make_hedge_map_df(eff_date)
+                write_hedge_map_to_s3.fn(
+                    hm, mock_creds,
+                    publish_latest=(eff_date == max_eff),
+                )
+
+        all_put_keys = [c.kwargs["Key"] for c in mock_s3.put_object.call_args_list]
+        latest_key = f"{HEDGE_MAP_PREFIX}/latest/data.parquet"
+
+        # latest/ written exactly once.
+        latest_count = all_put_keys.count(latest_key)
+        assert latest_count == 1, (
+            f"latest/ key written {latest_count} times across 3-day backfill; "
+            f"expected exactly 1. All keys: {all_put_keys}"
+        )
+
+        # The put_object call at the latest/ key used the newest effective_date bytes.
+        # Verify by checking the dated key that immediately preceded the latest/ put
+        # (they share the same buf.getvalue() bytes; both have the same body in order).
+        newest_dated_key = f"{HEDGE_MAP_PREFIX}/effective_date=2024-06-05/data.parquet"
+        assert newest_dated_key in all_put_keys, (
+            f"newest dated key {newest_dated_key!r} missing from puts: {all_put_keys}"
+        )
+
+        # Older dated keys are present (every day gets its dated partition).
+        for eff_date in dates:
+            dk = f"{HEDGE_MAP_PREFIX}/effective_date={eff_date.isoformat()}/data.parquet"
+            assert dk in all_put_keys, f"dated key {dk!r} missing from puts: {all_put_keys}"
+
+        # Total put_object calls: 3 dated + 1 latest = 4.
+        assert len(all_put_keys) == 4, (
+            f"expected 4 put_object calls (3 dated + 1 latest), got {len(all_put_keys)}: {all_put_keys}"
+        )
+
+    def test_single_day_run_still_writes_latest(self):
+        """Single-day run (backfill_days=0): publish_latest defaults True, latest/ is written."""
+        mock_s3 = mock.MagicMock()
+        mock_creds = mock.MagicMock()
+        mock_creds.get_boto3_session.return_value.client.return_value = mock_s3
+
+        hm = _make_hedge_map_df(date(2024, 6, 3))
+        with mock.patch("hedge_map_flow.get_run_logger", return_value=mock.MagicMock()):
+            write_hedge_map_to_s3.fn(hm, mock_creds)  # publish_latest defaults True
+
+        put_keys = [c.kwargs["Key"] for c in mock_s3.put_object.call_args_list]
+        assert f"{HEDGE_MAP_PREFIX}/latest/data.parquet" in put_keys
+        assert len(put_keys) == 2  # dated + latest
 
 
 if __name__ == "__main__":

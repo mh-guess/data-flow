@@ -721,13 +721,17 @@ def _latest_key(dated_key: str) -> str:
 def write_hedge_map_to_s3(
     hedge_map: pd.DataFrame,
     aws_credentials: AwsCredentials,
+    publish_latest: bool = True,
 ) -> str:
     """
     Write partitioned parquet to S3.
 
     Partition key: effective_date=YYYY-MM-DD/
-    Also writes a byte-identical copy to the ``latest/`` key so consumers can read
-    a stable address without date resolution. The returned URI is the dated partition.
+    When ``publish_latest=True`` (default) also writes a byte-identical copy to the
+    ``latest/`` key so consumers can read a stable address without date resolution.
+    Pass ``publish_latest=False`` for backfill iterations that are not the newest
+    effective_date — only the newest partition should claim the stable key.
+    The returned URI is the dated partition.
     """
     logger = get_run_logger()
     if hedge_map.empty:
@@ -777,24 +781,25 @@ def write_hedge_map_to_s3(
     uri = f"s3://{S3_BUCKET}/{key}"
     logger.info(f"Hedge map written: {uri} ({len(hm)} rows)")
 
-    # Publish stable latest/ copy. Re-put the same in-memory bytes (requires only
-    # s3:PutObject, no s3:GetObject; byte-identical to the dated object).
-    latest = _latest_key(key)
-    try:
-        s3.put_object(
-            Bucket=S3_BUCKET,
-            Key=latest,
-            Body=buf.getvalue(),
-            ContentType="application/x-parquet",
-        )
-    except Exception:
-        logger.error(
-            f"latest/ put failed for s3://{S3_BUCKET}/{latest}; dated partition "
-            "is intact but latest/ may point at the prior run until the next "
-            "successful run."
-        )
-        raise
-    logger.info(f"Hedge map latest:  s3://{S3_BUCKET}/{latest}")
+    if publish_latest:
+        # Publish stable latest/ copy. Re-put the same in-memory bytes (requires only
+        # s3:PutObject, no s3:GetObject; byte-identical to the dated object).
+        latest = _latest_key(key)
+        try:
+            s3.put_object(
+                Bucket=S3_BUCKET,
+                Key=latest,
+                Body=buf.getvalue(),
+                ContentType="application/x-parquet",
+            )
+        except Exception:
+            logger.error(
+                f"latest/ put failed for s3://{S3_BUCKET}/{latest}; dated partition "
+                "is intact but latest/ may point at the prior run until the next "
+                "successful run."
+            )
+            raise
+        logger.info(f"Hedge map latest:  s3://{S3_BUCKET}/{latest}")
 
     return uri
 
@@ -810,12 +815,14 @@ def write_run_manifest(
     aws_credentials: AwsCredentials,
     classification_snapshot_date: Optional[date] = None,
     coverage_stats: Optional[dict] = None,
+    publish_latest: bool = True,
 ) -> str:
     """
     Write sidecar JSON manifest for this run (v2: + classification + crosswalk stats).
 
-    Also writes a byte-identical copy to the ``latest/`` key. The returned URI is
-    the dated partition.
+    When ``publish_latest=True`` (default) also writes a byte-identical copy to the
+    ``latest/`` key. Pass ``publish_latest=False`` for backfill iterations that are
+    not the newest effective_date. The returned URI is the dated partition.
     """
     logger = get_run_logger()
 
@@ -855,24 +862,25 @@ def write_run_manifest(
     logger.info(f"Manifest written: {uri}")
     logger.info(json.dumps(manifest, indent=2))
 
-    # Publish stable latest/ copy. Re-put the same in-memory bytes (requires only
-    # s3:PutObject, no s3:GetObject; byte-identical to the dated object).
-    latest = _latest_key(key)
-    try:
-        s3.put_object(
-            Bucket=S3_BUCKET,
-            Key=latest,
-            Body=manifest_bytes,
-            ContentType="application/json",
-        )
-    except Exception:
-        logger.error(
-            f"latest/ put failed for s3://{S3_BUCKET}/{latest}; dated partition "
-            "is intact but latest/ may point at the prior run until the next "
-            "successful run."
-        )
-        raise
-    logger.info(f"Manifest latest:  s3://{S3_BUCKET}/{latest}")
+    if publish_latest:
+        # Publish stable latest/ copy. Re-put the same in-memory bytes (requires only
+        # s3:PutObject, no s3:GetObject; byte-identical to the dated object).
+        latest = _latest_key(key)
+        try:
+            s3.put_object(
+                Bucket=S3_BUCKET,
+                Key=latest,
+                Body=manifest_bytes,
+                ContentType="application/json",
+            )
+        except Exception:
+            logger.error(
+                f"latest/ put failed for s3://{S3_BUCKET}/{latest}; dated partition "
+                "is intact but latest/ may point at the prior run until the next "
+                "successful run."
+            )
+            raise
+        logger.info(f"Manifest latest:  s3://{S3_BUCKET}/{latest}")
 
     return uri
 
@@ -1140,6 +1148,11 @@ def hedge_map_flow(
     beta_as_of_overrides = _check_bar_availability(all_bars, as_of_dates, as_of_override is not None)
 
     # --- Process each as_of date ---
+    # Compute the newest effective_date across all runs upfront so we can gate
+    # publish_latest correctly: only the newest partition should claim latest/.
+    # Using max() is robust to any future ordering change in as_of_dates.
+    max_effective_date = max(_next_trading_day(d) for d in as_of_dates)
+
     results: list[dict] = []
     for run_as_of in as_of_dates:
         # beta_as_of: the last settled close used for betas/ADV. Normally equals run_as_of.
@@ -1176,7 +1189,9 @@ def hedge_map_flow(
         logger.info(f"  Coverage stats: {json.dumps(cov_stats)}")
 
         if not hedge_map.empty:
-            s3_uri = write_hedge_map_to_s3(hedge_map, aws_credentials)
+            publish_latest = (run_effective_date == max_effective_date)
+            s3_uri = write_hedge_map_to_s3(hedge_map, aws_credentials,
+                                           publish_latest=publish_latest)
             manifest_uri = write_run_manifest(
                 as_of=beta_as_of,
                 effective_date=run_effective_date,
@@ -1187,6 +1202,7 @@ def hedge_map_flow(
                 aws_credentials=aws_credentials,
                 classification_snapshot_date=class_snapshot_date,
                 coverage_stats=cov_stats,
+                publish_latest=publish_latest,
             )
             results.append({
                 "as_of": beta_as_of.isoformat(),
