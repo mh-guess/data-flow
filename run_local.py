@@ -46,6 +46,7 @@ from hedge_map_flow import (
     _fetch_multi_bars_page,
     _bars_to_df,
     _compute_returns,
+    _latest_key,
     beta_r2_pair,
     compute_adv,
     compute_eligibility,
@@ -263,6 +264,10 @@ def run(
         print(f"  WARNING: bar availability guard fired; beta_as_of adjusted for "
               f"{len(beta_as_of_overrides)} date(s). See log for details.")
 
+    # Only the newest effective_date should overwrite latest/. Compute the max
+    # upfront so the gate is robust to any future ordering change in as_of_dates.
+    max_effective_date = max(_next_trading_day(d) for d in as_of_dates)
+
     # Process each as_of date.
     results: list[dict] = []
     for run_as_of in as_of_dates:
@@ -322,9 +327,19 @@ def run(
 
         buf2 = io.BytesIO()
         hm.to_parquet(buf2, compression="snappy", index=False)
+        parquet_bytes = buf2.getvalue()
         parquet_key = f"{s3_prefix}/effective_date={effective_date.isoformat()}/data.parquet"
-        parquet_uri = write_to_s3_local(s3, parquet_key, buf2.getvalue(), "application/x-parquet")
+        parquet_uri = write_to_s3_local(s3, parquet_key, parquet_bytes, "application/x-parquet")
         print(f"  Parquet written: {parquet_uri}")
+
+        # Stable latest/ copy — only for the newest effective_date of a FULL run.
+        # Subset smoke runs must never overwrite latest/ (a 21-row subset would
+        # corrupt the consumer-facing stable address until the next nightly run).
+        publish_latest = (effective_date == max_effective_date) and not subset_symbols
+        if publish_latest:
+            latest_parquet_key = _latest_key(parquet_key)
+            write_to_s3_local(s3, latest_parquet_key, parquet_bytes, "application/x-parquet")
+            print(f"  Parquet latest:  s3://{S3_BUCKET}/{latest_parquet_key}")
 
         # Write manifest.
         # Use beta_as_of (the actual last close used for betas/ADV) — not run_as_of —
@@ -345,11 +360,18 @@ def run(
             "row_count": len(hm),
             "run_utc": datetime.now(timezone.utc).isoformat(),
         }
+        manifest_bytes = json.dumps(manifest, indent=2).encode()
         manifest_key = f"{s3_prefix}/manifests/effective_date={effective_date.isoformat()}/manifest.json"
-        write_to_s3_local(s3, manifest_key, json.dumps(manifest, indent=2).encode(), "application/json")
+        write_to_s3_local(s3, manifest_key, manifest_bytes, "application/json")
         print(f"  Manifest written: s3://{S3_BUCKET}/{manifest_key}")
 
-        results.append({
+        # Stable latest/ copy — only for the newest effective_date (backfill-safe).
+        if publish_latest:
+            latest_manifest_key = _latest_key(manifest_key)
+            write_to_s3_local(s3, latest_manifest_key, manifest_bytes, "application/json")
+            print(f"  Manifest latest:  s3://{S3_BUCKET}/{latest_manifest_key}")
+
+        result: dict = {
             "as_of": run_as_of.isoformat(),
             "effective_date": effective_date.isoformat(),
             "universe_size": len(universe),
@@ -359,7 +381,11 @@ def run(
             "coverage_pct": coverage_pct,
             "s3_uri": parquet_uri,
             "manifest_uri": f"s3://{S3_BUCKET}/{manifest_key}",
-        })
+        }
+        if publish_latest:
+            result["latest_s3_uri"] = f"s3://{S3_BUCKET}/{latest_parquet_key}"
+            result["latest_manifest_uri"] = f"s3://{S3_BUCKET}/{latest_manifest_key}"
+        results.append(result)
 
     print("\n" + "=" * 60)
     print("Completed. Results:")

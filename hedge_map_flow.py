@@ -13,9 +13,16 @@ sector/industry → ETF crosswalk (`hedge_crosswalk.py`) driven by Tiingo `meta`
 classification. Beta still SIZES each short via `beta_r2_pair()` vs the assigned
 ETF (one regression per assigned ETF, not 57). See project_docs/hedge_overlay.
 
-S3 output (canonical path — the apex team needs this; UNCHANGED from v1):
-  s3://mh-guess-data/hedge_map/effective_date=YYYY-MM-DD/data.parquet
+S3 outputs (the apex team depends on the dated partitions; latest/ is additive):
+  s3://mh-guess-data/hedge_map/effective_date=YYYY-MM-DD/data.parquet   (point-in-time)
   s3://mh-guess-data/hedge_map/manifests/effective_date=YYYY-MM-DD/manifest.json
+  s3://mh-guess-data/hedge_map/latest/data.parquet           (stable key, overwritten each run)
+  s3://mh-guess-data/hedge_map/manifests/latest/manifest.json
+
+Failure mode: if the dated put succeeds but the latest/ put fails (and all task
+retries are exhausted), latest/ silently points at the prior run's data until the
+next successful run. The dated partition is always intact; only the stable-key copy
+may lag. The task raises and logs logger.error before propagating so alerting fires.
 
 Sidecar manifest fields: effective_date, as_of_date, universe_size,
   eligible_count, coverage_pct, etf_set_version, crosswalk_version, row_count,
@@ -679,6 +686,34 @@ def _next_trading_day(d: date) -> date:
 
 
 # ---------------------------------------------------------------------------
+# S3 write helpers
+# ---------------------------------------------------------------------------
+
+def _latest_key(dated_key: str) -> str:
+    """
+    Derive the ``latest/`` S3 key from a dated partition key.
+
+    Replaces the ``effective_date=YYYY-MM-DD/`` path segment with ``latest/``
+    so consumers can read a stable, fixed-name key without date resolution.
+    Raises ``ValueError`` if no ``effective_date=`` segment is found — this
+    prevents silently writing to the wrong key on a malformed path.
+
+    Examples::
+
+        hedge_map/effective_date=2024-01-02/data.parquet
+        → hedge_map/latest/data.parquet
+
+        hedge_map/manifests/effective_date=2024-01-02/manifest.json
+        → hedge_map/manifests/latest/manifest.json
+    """
+    parts = dated_key.split("/")
+    new_parts = ["latest" if p.startswith("effective_date=") else p for p in parts]
+    if new_parts == parts:
+        raise ValueError(f"no effective_date= segment in key: {dated_key!r}")
+    return "/".join(new_parts)
+
+
+# ---------------------------------------------------------------------------
 # S3 write tasks
 # ---------------------------------------------------------------------------
 
@@ -686,12 +721,17 @@ def _next_trading_day(d: date) -> date:
 def write_hedge_map_to_s3(
     hedge_map: pd.DataFrame,
     aws_credentials: AwsCredentials,
+    publish_latest: bool = True,
 ) -> str:
     """
     Write partitioned parquet to S3.
 
     Partition key: effective_date=YYYY-MM-DD/
-    Returns the S3 URI of the written file.
+    When ``publish_latest=True`` (default) also writes a byte-identical copy to the
+    ``latest/`` key so consumers can read a stable address without date resolution.
+    Pass ``publish_latest=False`` for backfill iterations that are not the newest
+    effective_date — only the newest partition should claim the stable key.
+    The returned URI is the dated partition.
     """
     logger = get_run_logger()
     if hedge_map.empty:
@@ -740,6 +780,27 @@ def write_hedge_map_to_s3(
 
     uri = f"s3://{S3_BUCKET}/{key}"
     logger.info(f"Hedge map written: {uri} ({len(hm)} rows)")
+
+    if publish_latest:
+        # Publish stable latest/ copy. Re-put the same in-memory bytes (requires only
+        # s3:PutObject, no s3:GetObject; byte-identical to the dated object).
+        latest = _latest_key(key)
+        try:
+            s3.put_object(
+                Bucket=S3_BUCKET,
+                Key=latest,
+                Body=buf.getvalue(),
+                ContentType="application/x-parquet",
+            )
+        except Exception:
+            logger.error(
+                f"latest/ put failed for s3://{S3_BUCKET}/{latest}; dated partition "
+                "is intact but latest/ may point at the prior run until the next "
+                "successful run."
+            )
+            raise
+        logger.info(f"Hedge map latest:  s3://{S3_BUCKET}/{latest}")
+
     return uri
 
 
@@ -754,8 +815,15 @@ def write_run_manifest(
     aws_credentials: AwsCredentials,
     classification_snapshot_date: Optional[date] = None,
     coverage_stats: Optional[dict] = None,
+    publish_latest: bool = True,
 ) -> str:
-    """Write sidecar JSON manifest for this run (v2: + classification + crosswalk stats)."""
+    """
+    Write sidecar JSON manifest for this run (v2: + classification + crosswalk stats).
+
+    When ``publish_latest=True`` (default) also writes a byte-identical copy to the
+    ``latest/`` key. Pass ``publish_latest=False`` for backfill iterations that are
+    not the newest effective_date. The returned URI is the dated partition.
+    """
     logger = get_run_logger()
 
     # coverage_pct = fraction of eligible tickers with at least one valid hedge (rank=1 row).
@@ -779,18 +847,41 @@ def write_run_manifest(
         "run_utc": datetime.now(timezone.utc).isoformat(),
     }
 
+    manifest_bytes = json.dumps(manifest, indent=2).encode()
+
     key = f"{HEDGE_MAP_PREFIX}/manifests/effective_date={effective_date.isoformat()}/manifest.json"
     s3 = aws_credentials.get_boto3_session().client("s3")
     s3.put_object(
         Bucket=S3_BUCKET,
         Key=key,
-        Body=json.dumps(manifest, indent=2).encode(),
+        Body=manifest_bytes,
         ContentType="application/json",
     )
 
     uri = f"s3://{S3_BUCKET}/{key}"
     logger.info(f"Manifest written: {uri}")
     logger.info(json.dumps(manifest, indent=2))
+
+    if publish_latest:
+        # Publish stable latest/ copy. Re-put the same in-memory bytes (requires only
+        # s3:PutObject, no s3:GetObject; byte-identical to the dated object).
+        latest = _latest_key(key)
+        try:
+            s3.put_object(
+                Bucket=S3_BUCKET,
+                Key=latest,
+                Body=manifest_bytes,
+                ContentType="application/json",
+            )
+        except Exception:
+            logger.error(
+                f"latest/ put failed for s3://{S3_BUCKET}/{latest}; dated partition "
+                "is intact but latest/ may point at the prior run until the next "
+                "successful run."
+            )
+            raise
+        logger.info(f"Manifest latest:  s3://{S3_BUCKET}/{latest}")
+
     return uri
 
 
@@ -1057,6 +1148,11 @@ def hedge_map_flow(
     beta_as_of_overrides = _check_bar_availability(all_bars, as_of_dates, as_of_override is not None)
 
     # --- Process each as_of date ---
+    # Compute the newest effective_date across all runs upfront so we can gate
+    # publish_latest correctly: only the newest partition should claim latest/.
+    # Using max() is robust to any future ordering change in as_of_dates.
+    max_effective_date = max(_next_trading_day(d) for d in as_of_dates)
+
     results: list[dict] = []
     for run_as_of in as_of_dates:
         # beta_as_of: the last settled close used for betas/ADV. Normally equals run_as_of.
@@ -1093,7 +1189,9 @@ def hedge_map_flow(
         logger.info(f"  Coverage stats: {json.dumps(cov_stats)}")
 
         if not hedge_map.empty:
-            s3_uri = write_hedge_map_to_s3(hedge_map, aws_credentials)
+            publish_latest = (run_effective_date == max_effective_date)
+            s3_uri = write_hedge_map_to_s3(hedge_map, aws_credentials,
+                                           publish_latest=publish_latest)
             manifest_uri = write_run_manifest(
                 as_of=beta_as_of,
                 effective_date=run_effective_date,
@@ -1104,6 +1202,7 @@ def hedge_map_flow(
                 aws_credentials=aws_credentials,
                 classification_snapshot_date=class_snapshot_date,
                 coverage_stats=cov_stats,
+                publish_latest=publish_latest,
             )
             results.append({
                 "as_of": beta_as_of.isoformat(),
