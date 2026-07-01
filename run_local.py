@@ -46,6 +46,7 @@ from hedge_map_flow import (
     _fetch_multi_bars_page,
     _bars_to_df,
     _compute_returns,
+    _latest_key,
     beta_r2_pair,
     compute_adv,
     compute_eligibility,
@@ -322,9 +323,15 @@ def run(
 
         buf2 = io.BytesIO()
         hm.to_parquet(buf2, compression="snappy", index=False)
+        parquet_bytes = buf2.getvalue()
         parquet_key = f"{s3_prefix}/effective_date={effective_date.isoformat()}/data.parquet"
-        parquet_uri = write_to_s3_local(s3, parquet_key, buf2.getvalue(), "application/x-parquet")
+        parquet_uri = write_to_s3_local(s3, parquet_key, parquet_bytes, "application/x-parquet")
         print(f"  Parquet written: {parquet_uri}")
+
+        # Stable latest/ copy — byte-identical re-put (mirrors write_hedge_map_to_s3).
+        latest_parquet_key = _latest_key(parquet_key)
+        write_to_s3_local(s3, latest_parquet_key, parquet_bytes, "application/x-parquet")
+        print(f"  Parquet latest:  s3://{S3_BUCKET}/{latest_parquet_key}")
 
         # Write manifest.
         # Use beta_as_of (the actual last close used for betas/ADV) — not run_as_of —
@@ -345,9 +352,15 @@ def run(
             "row_count": len(hm),
             "run_utc": datetime.now(timezone.utc).isoformat(),
         }
+        manifest_bytes = json.dumps(manifest, indent=2).encode()
         manifest_key = f"{s3_prefix}/manifests/effective_date={effective_date.isoformat()}/manifest.json"
-        write_to_s3_local(s3, manifest_key, json.dumps(manifest, indent=2).encode(), "application/json")
+        write_to_s3_local(s3, manifest_key, manifest_bytes, "application/json")
         print(f"  Manifest written: s3://{S3_BUCKET}/{manifest_key}")
+
+        # Stable latest/ copy — byte-identical re-put (mirrors write_run_manifest).
+        latest_manifest_key = _latest_key(manifest_key)
+        write_to_s3_local(s3, latest_manifest_key, manifest_bytes, "application/json")
+        print(f"  Manifest latest:  s3://{S3_BUCKET}/{latest_manifest_key}")
 
         results.append({
             "as_of": run_as_of.isoformat(),
@@ -359,6 +372,8 @@ def run(
             "coverage_pct": coverage_pct,
             "s3_uri": parquet_uri,
             "manifest_uri": f"s3://{S3_BUCKET}/{manifest_key}",
+            "latest_s3_uri": f"s3://{S3_BUCKET}/{latest_parquet_key}",
+            "latest_manifest_uri": f"s3://{S3_BUCKET}/{latest_manifest_key}",
         })
 
     print("\n" + "=" * 60)

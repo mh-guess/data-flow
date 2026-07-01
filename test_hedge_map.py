@@ -9,6 +9,7 @@ Tests:
   5. Offline dry-run on synthetic fixture (no network)
   6. P1-a: Alpaca credential loading (_init_alpaca_creds)
   7. P1-b: Scheduled as_of default produces the right effective_date
+  8. _latest_key: stable S3 latest/ key derivation from dated partition keys
 """
 
 from __future__ import annotations
@@ -30,18 +31,23 @@ from hedge_map_flow import (
     ETF_CANDIDATES,
     MIN_N_OBS,
     ADV_MIN_USD,
+    S3_BUCKET,
+    HEDGE_MAP_PREFIX,
     beta_r2_pair,
     compute_adv,
     compute_eligibility,
     compute_hedge_map,
     _check_bar_availability,
     _compute_returns,
+    _latest_key,
     _next_trading_day,
     _latest_trading_day,
     _prior_trading_day,
     _trading_days_before,
     _is_trading_day,
     _init_alpaca_creds,
+    write_hedge_map_to_s3,
+    write_run_manifest,
     SYMBOL_REMAP,
     ALPACA_KEY_BLOCK,
     ALPACA_SECRET_BLOCK,
@@ -1349,6 +1355,168 @@ class TestRunLocalManifestAsOf:
         assert normal["as_of_date"] != lagged["as_of_date"], (
             "as_of_date must differ — it records the actual beta window, not the schedule"
         )
+
+
+# ---------------------------------------------------------------------------
+# 8. _latest_key: stable S3 latest/ key derivation
+# ---------------------------------------------------------------------------
+
+class TestLatestKey:
+    """Pure-function tests for _latest_key() S3 key derivation."""
+
+    # moto 5.x is installed in the agent env but is NOT a declared dependency in
+    # requirements.txt; the @task write functions also need Prefect run context +
+    # AwsCredentials. We test _latest_key() here and exercise the full upload path
+    # via mock in TestWriteS3LatestKeys below.
+
+    def test_data_parquet_key(self):
+        """Dated data.parquet key → latest/data.parquet."""
+        k = "hedge_map/effective_date=2024-01-02/data.parquet"
+        assert _latest_key(k) == "hedge_map/latest/data.parquet"
+
+    def test_manifest_json_key(self):
+        """Nested manifests/.../manifest.json → manifests/latest/manifest.json."""
+        k = "hedge_map/manifests/effective_date=2024-01-02/manifest.json"
+        assert _latest_key(k) == "hedge_map/manifests/latest/manifest.json"
+
+    def test_different_dates_same_latest(self):
+        """Different run dates produce the same latest/ key (stable consumer address)."""
+        k1 = "hedge_map/effective_date=2024-01-02/data.parquet"
+        k2 = "hedge_map/effective_date=2026-06-30/data.parquet"
+        assert _latest_key(k1) == _latest_key(k2)
+
+    def test_key_without_partition_segment_raises(self):
+        """Keys without effective_date= raise ValueError (loud failure, not silent miswrite)."""
+        k = "hedge_map/universe_snapshots/as_of=2024-01-02/universe.parquet"
+        with pytest.raises(ValueError, match="no effective_date= segment"):
+            _latest_key(k)
+
+    def test_leaf_filename_preserved(self):
+        """The leaf filename (data.parquet / manifest.json) is not altered."""
+        for leaf in ("data.parquet", "manifest.json"):
+            k = f"hedge_map/effective_date=2025-12-31/{leaf}"
+            assert _latest_key(k).endswith(f"/{leaf}")
+
+    def test_multiple_effective_date_segments_all_replaced(self):
+        """All effective_date= segments are replaced (position-agnostic, documents behavior)."""
+        k = "hedge_map/effective_date=2024-01-02/sub/effective_date=2024-01-02/data.parquet"
+        assert _latest_key(k) == "hedge_map/latest/sub/latest/data.parquet"
+
+
+# ---------------------------------------------------------------------------
+# 9. Upload functions: both dated and latest/ keys are written
+# ---------------------------------------------------------------------------
+
+def _make_hedge_map_df(effective_date: date = date(2024, 6, 3)) -> pd.DataFrame:
+    """Minimal one-row hedge_map DataFrame satisfying write_hedge_map_to_s3's dtype casts."""
+    as_of = effective_date - timedelta(days=1)
+    return pd.DataFrame([{
+        "effective_date": effective_date,
+        "as_of_date": as_of,
+        "ticker": "AAPL",
+        "rank": 1,
+        "hedge_etf": "XLK",
+        "beta": 1.2,
+        "r2": 0.75,
+        "n_obs": 60,
+        "etf_shortable": True,
+        "etf_easy_to_borrow": True,
+        "etf_adv_usd_30d": 500_000_000.0,
+        "stock_adv_usd_30d": 100_000_000.0,
+        "selection_basis": "heuristic_industry",
+        "industry_source": "pure_play",
+        "classification_sector": "Technology",
+        "classification_industry": "Semiconductors",
+        "classification_source": "tiingo",
+    }])
+
+
+class TestWriteS3LatestKeys:
+    """
+    Validates that the write tasks call put_object for BOTH the dated key AND the
+    latest/ key, with the correct Bucket and Key arguments. Uses unittest.mock to
+    patch get_run_logger (Prefect run context) and the boto3 s3 client (no live AWS).
+    Calls the undecorated .fn so the Prefect task machinery is bypassed entirely.
+    """
+
+    def _mock_s3_and_creds(self):
+        """Return (mock_s3, mock_aws_credentials) wired together."""
+        mock_s3 = mock.MagicMock()
+        mock_creds = mock.MagicMock()
+        mock_creds.get_boto3_session.return_value.client.return_value = mock_s3
+        return mock_s3, mock_creds
+
+    def test_write_hedge_map_puts_dated_key(self):
+        """write_hedge_map_to_s3 puts the dated partition key."""
+        hm = _make_hedge_map_df(date(2024, 6, 3))
+        mock_s3, mock_creds = self._mock_s3_and_creds()
+        with mock.patch("hedge_map_flow.get_run_logger", return_value=mock.MagicMock()):
+            write_hedge_map_to_s3.fn(hm, mock_creds)
+
+        put_keys = [c.kwargs["Key"] for c in mock_s3.put_object.call_args_list]
+        expected_dated = f"{HEDGE_MAP_PREFIX}/effective_date=2024-06-03/data.parquet"
+        assert expected_dated in put_keys, f"dated key missing from put_object calls: {put_keys}"
+
+    def test_write_hedge_map_puts_latest_key(self):
+        """write_hedge_map_to_s3 puts the latest/ key with the correct bucket."""
+        hm = _make_hedge_map_df(date(2024, 6, 3))
+        mock_s3, mock_creds = self._mock_s3_and_creds()
+        with mock.patch("hedge_map_flow.get_run_logger", return_value=mock.MagicMock()):
+            write_hedge_map_to_s3.fn(hm, mock_creds)
+
+        put_calls = mock_s3.put_object.call_args_list
+        latest_calls = [c for c in put_calls if c.kwargs["Key"] == f"{HEDGE_MAP_PREFIX}/latest/data.parquet"]
+        assert latest_calls, "latest/ data.parquet key was not written"
+        assert latest_calls[0].kwargs["Bucket"] == S3_BUCKET
+
+    def test_write_hedge_map_latest_body_matches_dated(self):
+        """Both put_object calls receive the same bytes (byte-identical copy)."""
+        hm = _make_hedge_map_df(date(2024, 6, 3))
+        mock_s3, mock_creds = self._mock_s3_and_creds()
+        with mock.patch("hedge_map_flow.get_run_logger", return_value=mock.MagicMock()):
+            write_hedge_map_to_s3.fn(hm, mock_creds)
+
+        bodies = [c.kwargs["Body"] for c in mock_s3.put_object.call_args_list]
+        assert len(bodies) == 2
+        assert bodies[0] == bodies[1], "dated and latest/ bodies must be byte-identical"
+
+    def test_write_manifest_puts_dated_and_latest_keys(self):
+        """write_run_manifest puts both the dated manifest key and manifests/latest/manifest.json."""
+        mock_s3, mock_creds = self._mock_s3_and_creds()
+        with mock.patch("hedge_map_flow.get_run_logger", return_value=mock.MagicMock()):
+            write_run_manifest.fn(
+                as_of=date(2024, 6, 2),
+                effective_date=date(2024, 6, 3),
+                universe_size=5000,
+                eligible_count=3000,
+                covered_tickers=2900,
+                hedge_map_rows=8700,
+                aws_credentials=mock_creds,
+            )
+
+        put_keys = [c.kwargs["Key"] for c in mock_s3.put_object.call_args_list]
+        expected_dated = f"{HEDGE_MAP_PREFIX}/manifests/effective_date=2024-06-03/manifest.json"
+        expected_latest = f"{HEDGE_MAP_PREFIX}/manifests/latest/manifest.json"
+        assert expected_dated in put_keys, f"dated manifest key missing: {put_keys}"
+        assert expected_latest in put_keys, f"latest/ manifest key missing: {put_keys}"
+
+    def test_write_manifest_latest_body_matches_dated(self):
+        """Both manifest put_object calls receive the same bytes."""
+        mock_s3, mock_creds = self._mock_s3_and_creds()
+        with mock.patch("hedge_map_flow.get_run_logger", return_value=mock.MagicMock()):
+            write_run_manifest.fn(
+                as_of=date(2024, 6, 2),
+                effective_date=date(2024, 6, 3),
+                universe_size=5000,
+                eligible_count=3000,
+                covered_tickers=2900,
+                hedge_map_rows=8700,
+                aws_credentials=mock_creds,
+            )
+
+        bodies = [c.kwargs["Body"] for c in mock_s3.put_object.call_args_list]
+        assert len(bodies) == 2
+        assert bodies[0] == bodies[1], "dated and latest/ manifest bodies must be byte-identical"
 
 
 if __name__ == "__main__":
